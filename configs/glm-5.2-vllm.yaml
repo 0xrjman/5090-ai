@@ -1,0 +1,35 @@
+name: "GLM-5.2 NVFP4 · vLLM"
+internal_name: glm-5.2-vllm
+runtime: vllm
+compose_file: compose/glm-vllm.yml
+container_name: vllm-glm-5.2
+port: 8000
+model:
+  weights_subdir: glm-5.2-nvfp4
+  hf_repo: nvidia/GLM-5.2-NVFP4
+  format: modelopt
+  chat_template: chat-templates/glm-5.2/chat_template.jinja
+params:
+  context: 1048576
+  kv_cache: fp8_e4m3
+env:
+  MODALITY: text
+  SPEC_CONFIG: ""
+  MAX_MODEL_LEN: 1048576
+  GPU_MEMORY_UTIL: 0.65
+  MAX_NUM_SEQS: 8
+  MAX_NUM_BATCHED: 4096
+genesis:
+  prealloc_v2: 0
+  p5b: 0
+  p67: 0
+  pn8: 0
+  pn34: 0
+  p82: 0
+  p98: 0
+  pn59: 0
+  pn54: 0
+  pn32: 0
+description: "Engine: vLLM v0.24.0 · TP8 · 753B NVFP4 · 1M Ctx · GLM-5.2"
+labels: [production]
+deprecated: false

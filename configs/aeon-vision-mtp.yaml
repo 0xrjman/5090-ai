@@ -1,0 +1,36 @@
+name: "AEON-XS MTP (Vision)"
+internal_name: vision-mtp
+runtime: vllm
+compose_file: compose/vllm.yml
+container_name: vllm-vision-mtp
+port: 8000
+model:
+  weights_subdir: aeon-qwen3.6-27b-ultimate-nvfp4-mtp-xs
+  hf_repo: AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-NVFP4-MTP-XS
+  format: modelopt
+  chat_template: chat-templates/aeon-vision/chat_template.jinja
+params:
+  context: 212992
+  kv_cache: fp8_e4m3
+  mtp: 3
+env:
+  MODALITY: vision
+  SPEC_CONFIG: '{"method":"qwen3_5_mtp","num_speculative_tokens":3}'
+  MAX_MODEL_LEN: 212992
+  GPU_MEMORY_UTIL: 0.94
+  MAX_NUM_SEQS: 8
+  MAX_NUM_BATCHED: 4096
+genesis:
+  prealloc_v2: 0
+  p5b: 0
+  p67: 0
+  pn8: 0
+  pn34: 0
+  p82: 0
+  p98: 0
+  pn59: 0
+  pn54: 0
+  pn32: 0
+description: "Engine: vLLM · KV: fp8_e4m3 · Ctx: 208K · MTP3 · Vision · AEON-XS"
+labels: [production, vision]
+deprecated: false

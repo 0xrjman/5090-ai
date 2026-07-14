@@ -104,12 +104,16 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        # Apply Genesis patches if any are enabled
-        if [[ "$${GENESIS_P5B:-0}" != "0" || "$${GENESIS_P98:-0}" != "0" || \
-              "$${GENESIS_P67:-0}" != "0" || "$${GENESIS_PN8:-0}" != "0" || \
-              "$${GENESIS_PN34:-0}" != "0" || "$${GENESIS_P82:-0}" != "0" || \
-              "$${GENESIS_PN59:-0}" != "0" || "$${GENESIS_PN54:-0}" != "0" || \
-              "$${GENESIS_PN32:-0}" != "0" || "$${GENESIS_PREALLOC_V2:-0}" != "0" ]]; then
+        # Apply Genesis patches if any GENESIS_ flag is non-zero
+        # Scan all GENESIS_ prefixed variables — no hard-coded list needed
+        has_genesis=false
+        for var in $(compgen -v | grep "^GENESIS_"); do
+          val="${!var}"
+          if [[ "$val" != "0" && -n "$val" ]]; then
+            has_genesis=true; break
+          fi
+        done
+        if $has_genesis; then
           python3 -m vllm._genesis.patches.apply_all
         fi
         # Pass-through all args plus modality-specific flags

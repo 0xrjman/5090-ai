@@ -1,0 +1,24 @@
+name: "GLM-5.2 NVFP4 · SGLang"
+internal_name: glm-5.2-sglang
+runtime: sglang
+compose_file: compose/glm-sglang.yml
+container_name: sglang-glm-5.2
+port: 8000
+model:
+  weights_subdir: glm-5.2-nvfp4
+  hf_repo: nvidia/GLM-5.2-NVFP4
+  format: modelopt
+  chat_template: ""
+params:
+  context: 1048576
+  kv_cache: fp8_e4m3
+env:
+  MODALITY: text
+  SPEC_CONFIG: ""
+  MAX_MODEL_LEN: 1048576
+  GPU_MEMORY_UTIL: 0.94
+  MAX_NUM_SEQS: 8
+  MAX_NUM_BATCHED: 4096
+description: "Engine: SGLang v0.5.14 · TP8 · 753B NVFP4 · 1M Ctx · GLM-5.2"
+labels: [experimental]
+deprecated: false

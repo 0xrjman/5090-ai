@@ -1,0 +1,26 @@
+name: "DFlash Vision"
+internal_name: beellama-dflash-vision
+runtime: beellama
+compose_file: compose/beellama/dflash-vision.yml
+container_name: beellama-qwen36-27b-dflash-vision
+port: 8080
+model:
+  weights_subdir: qwen3.6-27b-gguf
+  hf_repo: unsloth/Qwen3.6-27B-GGUF
+  format: gguf
+  gguf_file: qwen3.6-27b-gguf/unsloth-mtp-q5ks/Qwen3.6-27B-Q5_K_S.gguf
+  draft_file: qwen3.6-27b-gguf/anbeeld-dflash-iq4xs/Qwen3.6-27B-DFlash-IQ4_XS.gguf
+  mmproj_file: qwen3.6-27b-gguf/mmproj-F16.gguf
+params:
+  context: 262144
+  kv_cache: q5_0_q4_1
+speculative:
+  type: dflash
+env:
+  CTX_SIZE: 262144
+  BATCH_SIZE: 2048
+  U_BATCH_SIZE: 512
+  REASONING: on
+description: "Engine: beellama.cpp · KV: q5_0/q4_1 · Ctx: 262K · DFlash · Vision"
+labels: [production, vision]
+deprecated: false

@@ -1,0 +1,26 @@
+name: "Qwopus MTP Vision"
+internal_name: beellama-qwopus-mtp
+runtime: beellama
+compose_file: compose/beellama/qwopus-mtp-vision.yml
+container_name: beellama-qwopus-mtp-vision
+port: 8080
+model:
+  weights_subdir: qwopus-3.6-27b-coder-mtp-gguf
+  hf_repo: Jackrong/Qwopus3.6-27B-Coder-MTP-GGUF
+  format: gguf
+  gguf_file: qwopus-3.6-27b-coder-mtp-gguf/Qwopus3.6-27B-Coder-MTP-Q4_K_M.gguf
+  mmproj_file: qwopus-3.6-27b-coder-mtp-gguf/mmproj-F32.gguf
+params:
+  context: 262144
+  kv_cache: q5_0_q4_1
+speculative:
+  type: mtp
+  draft: 2
+env:
+  CTX_SIZE: 262144
+  BATCH_SIZE: 4096
+  U_BATCH_SIZE: 1024
+  REASONING: off
+description: "Engine: beellama.cpp · MTP · Ctx: 262K · Q4_K_M · Vision · Coder · no-thinking"
+labels: [production, vision, coder]
+deprecated: false
