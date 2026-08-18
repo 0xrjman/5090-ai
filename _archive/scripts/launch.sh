@@ -43,6 +43,9 @@ fi
 
 PORT="${PORT:-8020}"
 MODEL_DIR="${MODEL_DIR:-${ROOT_DIR}/models}"
+API_KEY="${VLLM_API_KEY:-${API_KEY:-}}"
+AUTH_HEADER=()
+[[ -n "$API_KEY" ]] && AUTH_HEADER=(-H "Authorization: Bearer ${API_KEY}")
 
 echo "[launch] MODEL_DIR=${MODEL_DIR}"
 echo "[launch] PORT=${PORT}"
@@ -88,14 +91,15 @@ echo "[launch] waiting for ${URL} (timeout ${READY_TIMEOUT}s)..."
 
 elapsed=0
 while (( elapsed < READY_TIMEOUT )); do
-  if curl -sf "$URL" >/dev/null 2>&1; then
+  if curl -sf "${AUTH_HEADER[@]}" "$URL" >/dev/null 2>&1; then
     echo ""
     echo "[launch] ✓ Server is ready!"
     echo "[launch] API: http://localhost:${PORT}/v1"
-    echo "[launch] Model: $(curl -sf "$URL" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["data"][0]["id"])' 2>/dev/null || echo 'qwen3.6')"
+    echo "[launch] Model: $(curl -sf "${AUTH_HEADER[@]}" "$URL" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["data"][0]["id"])' 2>/dev/null || echo 'qwen3.6')"
     echo ""
     echo "  Test: curl http://localhost:${PORT}/v1/chat/completions \\"
     echo "    -H 'Content-Type: application/json' \\"
+    [[ -n "$API_KEY" ]] && echo "    -H 'Authorization: Bearer ${API_KEY}' \\"
     echo "    -d '{\"model\":\"qwen3.6\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}],\"max_tokens\":50}'"
     exit 0
   fi

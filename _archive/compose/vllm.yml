@@ -78,6 +78,7 @@ services:
       # Standard vLLM env
       - NVIDIA_VISIBLE_DEVICES=${GPU_DEVICE:-0}
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - VLLM_API_KEY=${VLLM_API_KEY:-}
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
       - VLLM_BUILD_COMMIT=
       - VLLM_BUILD_PIPELINE=
@@ -92,6 +93,7 @@ services:
       - TRITON_CACHE_DIR=/root/.triton/cache
       - TRITON_COMPILE_BYTECODE=1
       - CUDA_DEVICE_MAX_CONNECTIONS=8
+    env_file: ./.env
     shm_size: "16gb"
     ipc: host
     deploy:
@@ -104,22 +106,18 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        # Apply Genesis patches if any GENESIS_ flag is non-zero
-        # Scan all GENESIS_ prefixed variables — no hard-coded list needed
-        has_genesis=false
-        for var in $(compgen -v | grep "^GENESIS_"); do
-          val="${!var}"
-          if [[ "$val" != "0" && -n "$val" ]]; then
-            has_genesis=true; break
-          fi
-        done
-        if $has_genesis; then
-          python3 -m vllm._genesis.patches.apply_all
-        fi
         # Pass-through all args plus modality-specific flags
         ARGS=("$$@")
         if [[ "$${MODALITY:-vision}" == "text" ]]; then
           ARGS+=(--language-model-only --skip-mm-profiling)
+        fi
+        # speculative-config via env var (bypasses YAML re-parse of JSON)
+        if [[ -n "$${SPEC_CONFIG:-}" ]]; then
+          ARGS+=(--speculative-config "$${SPEC_CONFIG}")
+        fi
+        # API key — require Authorization: Bearer <key> on every request
+        if [[ -n "$${VLLM_API_KEY:-}" ]]; then
+          ARGS+=(--api-key "$${VLLM_API_KEY}")
         fi
         exec vllm serve "$${ARGS[@]}"
       - "--"
@@ -157,7 +155,5 @@ services:
       - /etc/qwen-chat-template.jinja
       - --enable-prefix-caching
       - --enable-chunked-prefill
-      - --speculative-config
-      - ${SPEC_CONFIG:-{"method":"qwen3_5_mtp","num_speculative_tokens":3}}
       - --performance-mode
       - interactivity

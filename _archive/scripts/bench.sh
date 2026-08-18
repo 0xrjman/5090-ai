@@ -38,6 +38,7 @@ set -euo pipefail
 URL="${URL:-http://localhost:8020}"
 MODEL="${MODEL:-local}"
 CONTAINER="${CONTAINER:-vllm-qwen36-nvfp4-mtp}"
+API_KEY="${API_KEY:-}"
 RUNS="${RUNS:-1}"
 WARMUPS="${WARMUPS:-1}"
 TEMPERATURE="${TEMPERATURE:-0.6}"
@@ -59,7 +60,7 @@ need python3
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 
 # ── Preflight ───────────────────────────────────────────────────────────────
-if ! curl -sf "${URL}/v1/models" >/dev/null; then
+if ! curl -sf ${API_KEY:+-H "Authorization: Bearer ${API_KEY}"} "${URL}/v1/models" >/dev/null; then
   echo "ERROR: service not reachable at ${URL}/v1/models" >&2
   echo "  Start with: bash local-ai.sh" >&2
   exit 1
@@ -87,7 +88,7 @@ echo "========================================================================"
 echo ""
 
 # ── Run benchmark in Python ────────────────────────────────────────────────
-export TIMESTAMP SAVE SAVE_DIR
+export TIMESTAMP SAVE SAVE_DIR API_KEY
 python3 - "$URL" "$MODEL" "$CONTAINER" "$WARMUPS" "$RUNS" "$TEMPERATURE" "$TOP_P" $TIERS << 'PYEOF'
 import json, os, re, shutil, subprocess, sys, time, urllib.request, statistics as s
 from datetime import datetime
@@ -102,6 +103,7 @@ TIERS = [(int(p), int(o)) for pair in sys.argv[8:] for p, o in [pair.split(':')]
 TIMESTAMP = os.environ.get("TIMESTAMP", datetime.now().strftime("%Y%m%d-%H%M%S"))
 SAVE = os.environ.get("SAVE", "1") == "1"
 SAVE_DIR = os.environ.get("SAVE_DIR", "bench")
+API_KEY = os.environ.get("API_KEY", "")
 
 results = []  # accumulate for summary table
 
@@ -148,7 +150,8 @@ def run_once(prompt, max_tokens, run_label=""):
         "stream_options": {"include_usage": True},
     }).encode()
     req = urllib.request.Request(f"{URL}/v1/chat/completions", data=body,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          **({"Authorization": f"Bearer {API_KEY}"} if API_KEY else {})})
     t_send = time.time()
     ttft = None
     completion_tokens = 0

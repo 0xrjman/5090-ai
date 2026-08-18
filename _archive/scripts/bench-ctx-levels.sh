@@ -16,6 +16,7 @@ set -euo pipefail
 
 URL="${URL:-http://localhost:8020}"
 MODEL="${MODEL:-local}"
+API_KEY="${API_KEY:-}"
 OUTPUT="${OUTPUT:-200}"
 SAVE="${SAVE:-1}"
 
@@ -27,14 +28,14 @@ TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SAVE_DIR="${ROOT_DIR}/${SAVE_DIR}"
 
-if ! curl -sf "${URL}/v1/models" >/dev/null; then
+if ! curl -sf ${API_KEY:+-H "Authorization: Bearer ${API_KEY}"} "${URL}/v1/models" >/dev/null; then
   echo "ERROR: service not reachable at ${URL}/v1/models" >&2
   exit 1
 fi
 
 mkdir -p "$SAVE_DIR"
 
-export TIMESTAMP SAVE SAVE_DIR
+export TIMESTAMP SAVE SAVE_DIR API_KEY
 python3 - "$URL" "$MODEL" "$OUTPUT" "$TIMESTAMP" << 'PYEOF'
 import json, os, random, sys, time, statistics as s, urllib.request
 from datetime import datetime
@@ -46,12 +47,14 @@ OUTPUT = int(sys.argv[3])
 TIMESTAMP = sys.argv[4]
 SAVE = os.environ.get("SAVE", "1") == "1"
 SAVE_DIR = os.environ.get("SAVE_DIR", "bench")
+API_KEY = os.environ.get("API_KEY", "")
 
 # ── Step 1: Detect max_model_len ────────────────────────────
 def get_max_model_len():
     """Query vLLM model config to get max_model_len."""
     try:
-        req = urllib.request.Request(f"{URL}/v1/models")
+        req = urllib.request.Request(f"{URL}/v1/models",
+                                     headers={"Authorization": f"Bearer {API_KEY}"} if API_KEY else {})
         with urllib.request.urlopen(req, timeout=30) as r:
             data = json.loads(r.read())
             model_data = data["data"][0]
@@ -168,8 +171,9 @@ def send_request(ctx_tokens, seed, output_tokens):
     try:
         proc = sp.Popen(
             ["curl", "-sN", "--max-time", "600",
-             "-H", "Content-Type: application/json",
-             "-d", "@-", f"{URL}/v1/chat/completions"],
+             "-H", "Content-Type: application/json"] +
+            (["-H", f"Authorization: Bearer {API_KEY}"] if API_KEY else []) +
+            ["-d", "@-", f"{URL}/v1/chat/completions"],
             stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, bufsize=0)
         proc.stdin.write(body.encode())
         proc.stdin.close()

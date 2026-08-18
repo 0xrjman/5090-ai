@@ -55,6 +55,14 @@ _config_from_yaml() {
 # Single compose/vllm.yml drives all configs via env vars.
 # Add a new base model by adding a case here — no new compose files.
 
+# Curl auth header for API-key-protected servers (empty when no key set).
+# Usage: curl ... $(api_auth) ...
+api_auth() {
+  if [[ -n "${VLLM_API_KEY:-}" ]]; then
+    echo "-H \"Authorization: Bearer ${VLLM_API_KEY}\""
+  fi
+}
+
 export_vllm_vars() {
   local mode="$1"
 
@@ -323,7 +331,7 @@ is_ready() {
   local actual
   actual=$(find_running_container)
   [[ -n "$actual" ]] || return 1
-  curl -sf "http://localhost:${PORT}/v1/models" >/dev/null 2>&1 || return 1
+  curl -sf $(api_auth) "http://localhost:${PORT}/v1/models" >/dev/null 2>&1 || return 1
   return 0
 }
 
@@ -341,7 +349,7 @@ resolve_container() {
 }
 
 get_model_name() {
-  curl -sf "http://localhost:${PORT}/v1/models" 2>/dev/null | \
+  curl -sf $(api_auth) "http://localhost:${PORT}/v1/models" 2>/dev/null | \
     python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["data"][0]["id"])' 2>/dev/null || echo "?"
 }
 
@@ -375,6 +383,7 @@ quick_test_cached() {
   resp=$(curl -sf --max-time 10 \
     "http://localhost:${PORT}/v1/chat/completions" \
     -H "Content-Type: application/json" \
+    $(api_auth) \
     -d "$body" \
     -w '\n%{time_total}' 2>/dev/null) || true
 
@@ -407,6 +416,7 @@ quick_test_async() {
     resp=$(curl -sf --max-time 8 \
       "http://localhost:${PORT}/v1/chat/completions" \
       -H "Content-Type: application/json" \
+      $(api_auth) \
       -d "$body" \
       -w '\n%{time_total}' 2>/dev/null) || true
 
@@ -1515,7 +1525,7 @@ _do_status_json() {
 
   local ready="false"
   if $running; then
-    if curl -sf "http://localhost:${PORT}/v1/models" >/dev/null 2>&1; then
+    if curl -sf $(api_auth) "http://localhost:${PORT}/v1/models" >/dev/null 2>&1; then
       ready="true"
     fi
   fi
@@ -1609,6 +1619,7 @@ do_test() {
   local result
   result=$(curl -sf "http://localhost:${PORT}/v1/chat/completions" \
     -H "Content-Type: application/json" \
+    $(api_auth) \
     -d '{"model":"local","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":200}' 2>/dev/null)
   
   if [[ -n "$result" ]]; then

@@ -37,6 +37,7 @@ set -euo pipefail
 URL="${URL:-http://localhost:8020}"
 MODEL="${MODEL:-local}"
 CONTAINER="${CONTAINER:-vllm-text-mtp}"
+API_KEY="${API_KEY:-}"
 RUNS="${RUNS:-3}"
 WARMUPS="${WARMUPS:-1}"
 TEMPERATURE="${TEMPERATURE:-0.6}"
@@ -56,7 +57,7 @@ need python3
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 
-if ! curl -sf "${URL}/v1/models" >/dev/null; then
+if ! curl -sf ${API_KEY:+-H "Authorization: Bearer ${API_KEY}"} "${URL}/v1/models" >/dev/null; then
   echo "ERROR: service not reachable at ${URL}/v1/models" >&2
   echo "  Start with: ./local-ai.sh up" >&2
   exit 1
@@ -84,7 +85,7 @@ echo "    - KV cache pressure during the overlap window"
 echo "========================================================================"
 echo ""
 
-export TIMESTAMP SAVE SAVE_DIR
+export TIMESTAMP SAVE SAVE_DIR API_KEY
 python3 - "$URL" "$MODEL" "$CONTAINER" "$WARMUPS" "$RUNS" \
         "$TEMPERATURE" "$TOP_P" \
         "$BACKGROUND_PROMPT" "$BACKGROUND_OUTPUT" \
@@ -108,6 +109,7 @@ NEW_REQUEST_OUTPUT = int(sys.argv[11])
 TIMESTAMP = os.environ.get("TIMESTAMP", datetime.now().strftime("%Y%m%d-%H%M%S"))
 SAVE = os.environ.get("SAVE", "1") == "1"
 SAVE_DIR = os.environ.get("SAVE_DIR", "bench")
+API_KEY = os.environ.get("API_KEY", "")
 
 # ── Prompt generation ─────────────────────────────────────────────────
 def make_prompt(target_tokens):
@@ -151,7 +153,8 @@ def run_streaming(prompt, max_tokens, label=""):
         "stream_options": {"include_usage": True},
     }).encode()
     req = urllib.request.Request(f"{URL}/v1/chat/completions", data=body,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          **({"Authorization": f"Bearer {API_KEY}"} if API_KEY else {})})
     t_send = time.time()
     ttft = None
     first_token_text = None
@@ -221,7 +224,8 @@ def run_background_session():
         "stream_options": {"include_usage": True},
     }).encode()
     req = urllib.request.Request(f"{URL}/v1/chat/completions", data=body,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          **({"Authorization": f"Bearer {API_KEY}"} if API_KEY else {})})
     t_send = time.time()
     token_count = 0
     ttft = None

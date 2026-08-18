@@ -23,6 +23,7 @@ set -euo pipefail
 
 URL="${URL:-http://localhost:8020}"
 MODEL="${MODEL:-local}"
+API_KEY="${API_KEY:-}"
 LEVELS="${LEVELS:-1 2 4 6 8 10}"
 RUNS="${RUNS:-4}"
 WARMUPS="${WARMUPS:-1}"
@@ -35,7 +36,7 @@ need() {
 need curl
 need python3
 
-if ! curl -sf "${URL}/v1/models" >/dev/null; then
+if ! curl -sf ${API_KEY:+-H "Authorization: Bearer ${API_KEY}"} "${URL}/v1/models" >/dev/null; then
   echo "ERROR: service not reachable at ${URL}/v1/models" >&2
   exit 1
 fi
@@ -50,7 +51,7 @@ echo "  Prompt sizes: ${PROMPT_SIZES} tokens"
 echo ""
 
 python3 - "$URL" "$MODEL" "$RUNS" "$WARMUPS" "$MAX_TOKENS" $PROMPT_SIZES $LEVELS << 'PYEOF'
-import json, sys, time, urllib.request, statistics as s
+import json, os, sys, time, urllib.request, statistics as s
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 URL = sys.argv[1]
@@ -58,6 +59,7 @@ MODEL = sys.argv[2]
 RUNS = int(sys.argv[3])
 WARMUPS = int(sys.argv[4])
 MAX_TOKENS = int(sys.argv[5])
+API_KEY = os.environ.get("API_KEY", "")
 
 # Parse prompt sizes and levels from remaining args
 # First N args that are large numbers = prompt sizes, rest = levels
@@ -90,7 +92,8 @@ def send_request(prompt, max_tokens):
         "stream_options": {"include_usage": True},
     }).encode()
     req = urllib.request.Request(f"{URL}/v1/chat/completions", data=body,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          **({"Authorization": f"Bearer {API_KEY}"} if API_KEY else {})})
     t_send = time.time()
     ttft = None
     completion_tokens = 0
