@@ -34,6 +34,8 @@ start() {
     --max-concurrency 4 \
     --spec mtp --draft-tokens 3 --lm-head-draft
   echo "started, tail logs with: $0 logs"
+  _dash="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/dashboard/dashboard.sh"
+  [ -f "$_dash" ] && bash "$_dash" start || true
 }
 
 stop() {

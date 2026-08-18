@@ -47,6 +47,8 @@ start() {
       --served-model-name local \
       --host 0.0.0.0 --port 30000
   echo "started: $NAME (port $PORT, api-key=rjman, model=local, $SCENARIO_NOTE, concurrency=$CONCURRENT)"
+  _dash="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/dashboard/dashboard.sh"
+  [ -f "$_dash" ] && bash "$_dash" start || true
 }
 
 stop()   { docker rm -f "$NAME" >/dev/null 2>&1 && echo "stopped: $NAME" || echo "not running"; }

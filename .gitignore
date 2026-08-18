@@ -4,4 +4,8 @@
 # runtime logs
 *.log
 
+# python bytecode (dashboard.py runs in place)
+__pycache__/
+*.pyc
+
 # weights and JIT caches live under _archive/ and are ignored by _archive/.gitignore

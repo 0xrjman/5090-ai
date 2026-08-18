@@ -1,52 +1,54 @@
-# local-ai
+# profiles
 
-Local LLM serving for a single RTX 5090. One model — **Qwen3.8-27B-NVFP4** —
-served by three interchangeable inference frameworks, all on one port (8020).
+One directory per model; one script per inference framework. Each script is
+self-contained (`start`/`stop`/`status`/`logs`) and documents its checkpoint
+source in the header.
 
-## Matrix
+## Convention
 
-Each profile pairs a checkpoint build with an inference framework. They all run
-on the same GPU and port, so they are **mutually exclusive** (starting one stops
-the siblings).
+```
+profiles/<model>/<framework>.sh
+```
 
-| ckpt build (source)              | vLLM      | SGLang                                        | NInfer    |
-|----------------------------------|-----------|-----------------------------------------------|-----------|
-| Qwen3.8-27B-NVFP4 · **unsloth**  | `vllm.sh` | —                                             | —         |
-| Qwen3.8-27B-NVFP4 · **radixark** | —         | `sglang.sh main` / `sglang.sh longctx`        | —         |
-| Qwen3.8-27B-NVFP4 · **NInfer**   | —         | —                                             | `ninfer.sh`|
+All profiles on a machine share one GPU and (by default) one port, so they are
+mutually exclusive — a profile's `start` should stop the siblings that would
+conflict.
 
-## Usage
+## Dashboard (shared across profiles)
+
+`profiles/dashboard/` is a background monitor that tails the serving container's
+**real docker logs** and renders live metrics at **http://localhost:8021/**:
+decode/prefill TPS (now/avg/peak), per-request **concurrent streams** with a
+color-coded pressure bar (elapsed time), a concurrency-over-time chart, request
+aggregates, the live queue + errors, and a raw log tail. NInfer log parsing is
+implemented; vLLM/SGLang show their raw log and can be added via a parser in
+`dashboard.py::PARSERS`.
+
+Every profile's `start` auto-launches (or overwrite-restarts) it, so it is always
+running current code while a server is up:
 
 ```bash
-cd profiles/qwen38-27b
-
-./vllm.sh   [start|stop|status|logs]                 # vLLM (unsloth build)
-./sglang.sh [main|longctx] [start|stop|status|logs]  # SGLang (radixark build)
-./ninfer.sh [start|stop|status|logs]                 # NInfer (.ninfer build)
+profiles/dashboard/dashboard.sh [start|stop|status|logs]
 ```
 
-- `sglang.sh` defaults to scenario `main` (concurrency 2). Use `longctx` for a
-  single long-context session (concurrency 1).
-- OpenAI-compatible API: `http://localhost:8020/v1`, model `local`, api-key `rjman`.
+## Adding a new cell
 
-## Watchdog
+1. Add a framework script next to the siblings, following the same
+   `start/stop/status/logs` shape.
+2. Record the checkpoint provenance in the header: the source (HF / ModelScope
+   repo), the local path, and the `hf download` command.
+3. End `start` with the dashboard auto-launch (so it starts/refreshes on every
+   boot), exactly as the siblings do:
+   ```bash
+   _dash="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/dashboard/dashboard.sh"
+   [ -f "$_dash" ] && bash "$_dash" start || true
+   ```
+4. Add the row/column to the matrix in the root `README.md`.
 
-A per-minute cron job restarts the vLLM server once the GPU has been idle for 5
-consecutive minutes, and backs off while anything else is using the GPU
-(`profiles/watchdog/vllm-autostart.sh`).
+## Notes (measured)
 
-## Checkpoints
-
-Weights are large (~20 GB each) and are **not** in this repo. Each profile script
-documents its source (Hugging Face / ModelScope) and the exact `hf download`
-command in its header.
-
-## Layout
-
-```
-local-ai/
-  profiles/          active serving matrix (this box, single 5090)
-    qwen38-27b/      vllm.sh · sglang.sh · ninfer.sh
-    watchdog/        vllm-autostart.sh
-  _archive/          the previous B200 / 8×GPU declarative serving system, intact
-```
+- SGLang + DSpark speculative decoding on this 5090 deployment gave **no** decode
+  throughput gain (77 vs 78 tok/s, within noise) and shrank the KV pool, so DSpark
+  is off in both scenarios. Measured pure-decode throughput is ~77-78 tok/s
+  (2026-08-15, RadixArk Qwen3.8-27B-NVFP4). Re-check only after
+  sglang-project/sglang PR #34742 lands and the image is repulled.
