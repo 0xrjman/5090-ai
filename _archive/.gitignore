@@ -1,0 +1,18 @@
+# Generated per-config env (auto-written by local-ai.sh)
+compose/.env
+
+# Weights & secrets
+.env
+models/*
+!models/.gitkeep
+
+# Runtime caches (populated by vLLM at boot)
+cache/triton/*
+cache/torch_compile/*
+cache/flashinfer/*
+!cache/*/.gitkeep
+
+# OS
+.DS_Store
+*.swp
+*~

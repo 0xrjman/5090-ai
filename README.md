@@ -1,173 +1,52 @@
-# local-ai 🚀
+# local-ai
 
-**Multi-engine LLM serving for NVIDIA GPUs — managed by CLI, driven by AI Agents.**
+Local LLM serving for a single RTX 5090. One model — **Qwen3.8-27B-NVFP4** —
+served by three interchangeable inference frameworks, all on one port (8020).
 
-```bash
-git clone https://github.com/0xrjman/local-ai && cd local-ai
-./local-ai.sh
-```
+## Matrix
 
----
+Each profile pairs a checkpoint build with an inference framework. They all run
+on the same GPU and port, so they are **mutually exclusive** (starting one stops
+the siblings).
 
-## Quick Start
+| ckpt build (source)              | vLLM      | SGLang                                        | NInfer    |
+|----------------------------------|-----------|-----------------------------------------------|-----------|
+| Qwen3.8-27B-NVFP4 · **unsloth**  | `vllm.sh` | —                                             | —         |
+| Qwen3.8-27B-NVFP4 · **radixark** | —         | `sglang.sh main` / `sglang.sh longctx`        | —         |
+| Qwen3.8-27B-NVFP4 · **NInfer**   | —         | —                                             | `ninfer.sh`|
 
-```bash
-# Interactive TUI menu
-./local-ai.sh
-
-# Non-interactive: start with a specific engine
-./local-ai.sh up                        # uses default (glm-5.2-vllm)
-ENGINE=vision-mtp ./local-ai.sh up      # specific engine
-```
-
----
-
-## Agent Workflow
-
-The core usage pattern: **start the server → let AI Agents use it via OpenAI-compatible API**.
+## Usage
 
 ```bash
-# 1. Start a server
-./local-ai.sh up
+cd profiles/qwen38-27b
 
-# 2. Agent connects via standard OpenAI API
-curl http://localhost:8020/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"local","messages":[{"role":"user","content":"Hello"}]}'
+./vllm.sh   [start|stop|status|logs]                 # vLLM (unsloth build)
+./sglang.sh [main|longctx] [start|stop|status|logs]  # SGLang (radixark build)
+./ninfer.sh [start|stop|status|logs]                 # NInfer (.ninfer build)
 ```
 
-**For AI Agents (structured output):**
+- `sglang.sh` defaults to scenario `main` (concurrency 2). Use `longctx` for a
+  single long-context session (concurrency 1).
+- OpenAI-compatible API: `http://localhost:8020/v1`, model `local`, api-key `rjman`.
 
-```bash
-# Discover available configs (JSON)
-local-ai config list --json
+## Watchdog
 
-# Switch config and restart
-local-ai config switch vision-mtp
+A per-minute cron job restarts the vLLM server once the GPU has been idle for 5
+consecutive minutes, and backs off while anything else is using the GPU
+(`profiles/watchdog/vllm-autostart.sh`).
 
-# Check service status (JSON)
-local-ai status --json
+## Checkpoints
 
-# Health check (exit code 0 = ready)
-local-ai health
+Weights are large (~20 GB each) and are **not** in this repo. Each profile script
+documents its source (Hugging Face / ModelScope) and the exact `hf download`
+command in its header.
 
-# Get connection info for Agent configuration
-local-ai info --json
-# → {"url":"http://localhost:8020/v1","model":"local","config":"vision-mtp","port":8020}
-```
-
----
-
-## Engine Configurations
-
-Declarative configs in `configs/*.yaml`. Add a new model by adding one file.
-
-| # | Engine | GPU | VRAM | Context | Runtime |
-|---|--------|-----|------|---------|---------|
-| 1 | AEON-XS MTP (Vision) 🟢 | 1× 5090/B200 | ~170 GB | 208K | vLLM |
-| 2 | AEON-XS MTP+TQ (Vision) | 1× B200 | ~170 GB | 324K | vLLM + Genesis |
-| 3 | AEON-XS MTP (Text) 🟢 | 1× 5090/B200 | ~170 GB | 228K | vLLM |
-| 4 | Huihui NVFP4+MTP (Vision) | 1× B200 | ~170 GB | 208K | vLLM [deprecated] |
-| 5 | Huihui NVFP4+MTP+TQ (Vision) | 1× B200 | ~170 GB | 312K | vLLM + Genesis [deprecated] |
-| 6 | Beellama DFlash Vision | 1× 5090/B200 | ~24 GB | 262K | Beellama |
-| 7 | Beellama Qwopus MTP Vision | 1× 5090/B200 | ~24 GB | 262K | Beellama |
-| 8 | GLM-5.2 NVFP4 · vLLM 🆕 | **8× B200** | ~116 GB | **1M** | vLLM |
-| 9 | GLM-5.2 NVFP4 · SGLang 🆕 | **8× B200** | ~116 GB | **1M** | SGLang [WIP] |
-
-> 🟢 = production-ready · 🆕 = newly added
-
----
-
-## CLI Reference
-
-### Server Commands
-
-| Command | Description |
-|---------|-------------|
-| `local-ai up` | Start server |
-| `local-ai down` | Stop server |
-| `local-ai status` | Show status |
-| `local-ai status --json` | Status as JSON |
-| `local-ai logs` | Tail logs |
-| `local-ai health` | Health check (exit 0 = ready) |
-| `local-ai info --json` | Connection info for Agents |
-| `local-ai bench` | Run benchmark |
-
-### Config Commands
-
-| Command | Description |
-|---------|-------------|
-| `local-ai config list` | List configs (JSON) |
-| `local-ai config list --table` | List configs (TUI table) |
-| `local-ai config show <name>` | Show config detail (JSON) |
-| `local-ai config switch <name>` | Switch config + auto-restart |
-| `local-ai config add ...` | Create new config |
-| `local-ai config delete <name>` | Delete config |
-
-### Env Variables
-
-```bash
-ENGINE=vision-mtp ./local-ai.sh up    # Select engine
-MODEL_DIR=/path/to/models ./local-ai.sh up  # Override model path
-```
-
-### Adding a New Engine
-
-```bash
-# Add a new config file
-local-ai config add \
-  --name "My Custom Model" \
-  --internal my-model \
-  --runtime vllm \
-  --weights my-model-dir \
-  --hf-repo owner/model-name
-
-# Or create configs/my-model.yaml directly
-```
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────┐
-│   CLI / TUI (local-ai.sh)   │
-│  up/down/status/bench      │
-├─────────────────────────────┤
-│  Config Layer               │
-│  configs/*.yaml            │  ← declarative, Agent-readable
-│  lib/config_loader.py      │  ← JSON CLI, schema validation
-├─────────────────────────────┤
-│  Runtime (Docker Compose)  │
-│  vllm.yml / glm-*.yml      │  ← env-var-driven
-├─────────────────────────────┤
-│  Engines                     │
-│  vLLM · SGLang · Beellama    │
-└─────────────────────────────┘
-```
-
-## Project Layout
+## Layout
 
 ```
 local-ai/
-├── local-ai.sh              # Main TUI + CLI entry point
-├── configs/                  # Declarative engine configs (YAML)
-│   ├── aeon-vision-mtp.yaml
-│   ├── glm-5.2-vllm.yaml
-│   └── ...
-├── lib/
-│   └── config_loader.py      # Config loader + Agent CLI
-├── compose/
-│   ├── vllm.yml            # Unified vLLM compose
-│   ├── glm-vllm.yml        # GLM-5.2 vLLM (TP=8)
-│   ├── glm-sglang.yml       # GLM-5.2 SGLang (TP=8)
-│   └── beellama/           # Beellama compose files
-├── genesis/vllm/           # Genesis performance patches (123 patches)
-├── chat-templates/         # Jinja2 chat templates
-├── cache/                  # Persistent JIT caches
-└── scripts/                # Benchmark scripts
+  profiles/          active serving matrix (this box, single 5090)
+    qwen38-27b/      vllm.sh · sglang.sh · ninfer.sh
+    watchdog/        vllm-autostart.sh
+  _archive/          the previous B200 / 8×GPU declarative serving system, intact
 ```
-
----
-
-<p align="center"><sub>Built for RTX 5090 · B200 · Blackwell — managed by CLI, driven by Agents.</sub></p>

@@ -1,18 +1,7 @@
-# Generated per-config env (auto-written by local-ai.sh)
-compose/.env
-
-# Weights & secrets
+# secrets
 .env
-models/*
-!models/.gitkeep
 
-# Runtime caches (populated by vLLM at boot)
-cache/triton/*
-cache/torch_compile/*
-cache/flashinfer/*
-!cache/*/.gitkeep
+# runtime logs
+*.log
 
-# OS
-.DS_Store
-*.swp
-*~
+# weights and JIT caches live under _archive/ and are ignored by _archive/.gitignore
