@@ -12,10 +12,16 @@ IMG=vllm/vllm-openai:v0.27.1
 MODEL=/home/rjman/data/models/qwen3.8-27b-nvfp4-unsloth
 PORT=8020
 
-SPEC_METHOD="${SPEC_METHOD:-dflash}"   # dflash (default) | mtp
+SPEC_METHOD="${SPEC_METHOD:-mtp}"   # mtp (default) | dflash (BROKEN on vllm/vllm-openai:v0.27.1, see below)
 DFLASH_DIR="${DFLASH_DIR:-/home/rjman/data/models/qwen3.8-27b-dflash2}"
 DFLASH_NUM_SPEC="${DFLASH_NUM_SPEC:-8}"
 
+# Measured 2026-08-19: vllm/vllm-openai:v0.27.1 rejects the DFlash2 draft
+# checkpoint at startup -- pydantic ValidationError, "Model architectures
+# ['DFlash2DraftModel'] are not supported for now" (crash-loops under
+# --restart=always). Not a missing-weights problem; the draft arch just
+# isn't in this vLLM build's registry. Left switchable in case a future
+# vLLM image adds support -- don't flip the default back without re-testing.
 if [ "$SPEC_METHOD" = "dflash" ] && [ ! -d "$DFLASH_DIR" ]; then
   echo "WARN: SPEC_METHOD=dflash but $DFLASH_DIR is missing -- falling back to mtp." >&2
   echo "      download first: HF_ENDPOINT=https://hf-mirror.com hf download z-lab/Qwen3.8-27B-DFlash2 --local-dir $DFLASH_DIR" >&2

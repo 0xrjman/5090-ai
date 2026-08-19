@@ -52,10 +52,20 @@ profiles/dashboard/dashboard.sh [start|stop|status|logs]
   is off in both scenarios. Measured pure-decode throughput is ~77-78 tok/s
   (2026-08-15, RadixArk Qwen3.8-27B-NVFP4). Re-check only after
   sglang-project/sglang PR #34742 lands and the image is repulled.
-- `vllm.sh` / `sglang.sh` default to `SPEC_METHOD=dflash` (DFlash2 block-diffusion
-  drafter, `z-lab/Qwen3.8-27B-DFlash2`). Needs the draft checkpoint downloaded to
-  `DFLASH_DIR` first (see the `refetch` comment at the top of each script, use
-  `HF_ENDPOINT=https://hf-mirror.com` if HF is unreachable directly) — if the dir
-  is missing at `start`, the script warns and falls back to `SPEC_METHOD=mtp`
-  (vllm.sh) or `none` (sglang.sh) instead of failing to start. Not yet
-  throughput-tested on this box (2026-08-19) — measure before trusting the default.
+- **`vllm.sh` DFlash2 is broken, do not default to it.** Measured 2026-08-19 on
+  `vllm/vllm-openai:v0.27.1` with the real `z-lab/Qwen3.8-27B-DFlash2` weights
+  downloaded and mounted: vLLM rejects the checkpoint at startup with
+  `pydantic_core.ValidationError: Model architectures ['DFlash2DraftModel'] are
+  not supported for now` and crash-loops under `--restart=always`. This is not
+  a missing-weights problem — the draft architecture just isn't in this vLLM
+  build's model registry. `vllm.sh` now defaults to `SPEC_METHOD=mtp`;
+  `SPEC_METHOD=dflash` is left switchable only in case a future vLLM image adds
+  support — don't flip the default back without re-testing on the actual image.
+- `sglang.sh` still defaults to `SPEC_METHOD=dflash` (uses sglang's native
+  `--speculative-algorithm DFLASH` flag, a different code path from vLLM's
+  `--speculative-config`) and has **not yet been throughput/startup-tested**
+  with the real weights on this box — the vllm.sh failure above does not imply
+  sglang.sh is broken too, but don't trust it until it's actually been started
+  and measured. Weights live at `/home/rjman/data/models/qwen3.8-27b-dflash2`
+  (real files) with `/home/rjman/models/qwen3.8-27b-dflash2` symlinked to the
+  same dir — no need to re-download for sglang.
