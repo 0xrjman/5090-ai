@@ -3,6 +3,10 @@
 # ckpt (HF): RadixArk (base: Qwen/Qwen3.8-27B) [confirm exact repo id on HF]
 # refetch:   hf download <RadixArk/Qwen3.8-27B-NVFP4> --local-dir /home/rjman/models/qwen3.8-27b-nvfp4-radixark
 #
+# draft (HF): z-lab/Qwen3.8-27B-DFlash2 (block-diffusion drafter, for SPEC_METHOD=dflash)
+# refetch:    HF_ENDPOINT=https://hf-mirror.com hf download z-lab/Qwen3.8-27B-DFlash2 \
+#               --local-dir /home/rjman/models/qwen3.8-27b-dflash2
+#
 # scenarios (mutually exclusive, one 27B fits the 32GB):
 #   main    concurrency=2  --max-mamba-cache-size 8
 #   longctx concurrency=1  --max-mamba-cache-size 4  (single session, max context)
@@ -12,6 +16,30 @@ NAME=sglang-qwen38
 IMG=lmsysorg/sglang:qwen38-27b
 MODEL=/home/rjman/models/qwen3.8-27b-nvfp4-radixark
 PORT=8020
+
+SPEC_METHOD="${SPEC_METHOD:-dflash}"   # dflash (default) | none
+DFLASH_DIR="${DFLASH_DIR:-/home/rjman/models/qwen3.8-27b-dflash2}"
+DFLASH_NUM_SPEC="${DFLASH_NUM_SPEC:-8}"
+
+if [ "$SPEC_METHOD" = "dflash" ] && [ ! -d "$DFLASH_DIR" ]; then
+  echo "WARN: SPEC_METHOD=dflash but $DFLASH_DIR is missing -- falling back to no speculative decoding." >&2
+  echo "      download first: HF_ENDPOINT=https://hf-mirror.com hf download z-lab/Qwen3.8-27B-DFlash2 --local-dir $DFLASH_DIR" >&2
+  SPEC_METHOD=none
+fi
+
+DFLASH_MOUNT=()
+SPEC_ARGS=()
+case "$SPEC_METHOD" in
+  dflash)
+    DFLASH_MOUNT=(-v "$DFLASH_DIR":/draft:ro)
+    SPEC_ARGS=(--speculative-algorithm DFLASH --speculative-draft-model-path /draft --speculative-num-draft-tokens "$DFLASH_NUM_SPEC")
+    ;;
+  none) ;;
+  *)
+    echo "unknown SPEC_METHOD: $SPEC_METHOD (expected dflash|none)" >&2
+    exit 1
+    ;;
+esac
 
 SCENARIO=""
 case "${1:-}" in
@@ -32,6 +60,7 @@ start() {
     -p 0.0.0.0:${PORT}:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     -v "$MODEL":/models:ro \
+    "${DFLASH_MOUNT[@]}" \
     "$IMG" \
     sglang serve \
       --trust-remote-code \
@@ -45,8 +74,9 @@ start() {
       --tool-call-parser qwen3_coder \
       --api-key rjman \
       --served-model-name local \
-      --host 0.0.0.0 --port 30000
-  echo "started: $NAME (port $PORT, api-key=rjman, model=local, $SCENARIO_NOTE, concurrency=$CONCURRENT)"
+      --host 0.0.0.0 --port 30000 \
+      "${SPEC_ARGS[@]}"
+  echo "started: $NAME (port $PORT, api-key=rjman, model=local, $SCENARIO_NOTE, concurrency=$CONCURRENT, spec=$SPEC_METHOD)"
   _profiles_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   echo "sglang:$SCENARIO" > "$_profiles_dir/watchdog/.last-engine" 2>/dev/null || true
   _dash="$_profiles_dir/dashboard/dashboard.sh"

@@ -52,3 +52,10 @@ profiles/dashboard/dashboard.sh [start|stop|status|logs]
   is off in both scenarios. Measured pure-decode throughput is ~77-78 tok/s
   (2026-08-15, RadixArk Qwen3.8-27B-NVFP4). Re-check only after
   sglang-project/sglang PR #34742 lands and the image is repulled.
+- `vllm.sh` / `sglang.sh` default to `SPEC_METHOD=dflash` (DFlash2 block-diffusion
+  drafter, `z-lab/Qwen3.8-27B-DFlash2`). Needs the draft checkpoint downloaded to
+  `DFLASH_DIR` first (see the `refetch` comment at the top of each script, use
+  `HF_ENDPOINT=https://hf-mirror.com` if HF is unreachable directly) — if the dir
+  is missing at `start`, the script warns and falls back to `SPEC_METHOD=mtp`
+  (vllm.sh) or `none` (sglang.sh) instead of failing to start. Not yet
+  throughput-tested on this box (2026-08-19) — measure before trusting the default.
