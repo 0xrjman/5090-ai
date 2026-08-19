@@ -34,7 +34,9 @@ start() {
     --max-concurrency 4 \
     --spec mtp --draft-tokens 3 --lm-head-draft
   echo "started, tail logs with: $0 logs"
-  _dash="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/dashboard/dashboard.sh"
+  _profiles_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  echo "ninfer" > "$_profiles_dir/watchdog/.last-engine" 2>/dev/null || true
+  _dash="$_profiles_dir/dashboard/dashboard.sh"
   [ -f "$_dash" ] && bash "$_dash" start || true
 }
 

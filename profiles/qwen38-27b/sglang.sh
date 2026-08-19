@@ -47,7 +47,9 @@ start() {
       --served-model-name local \
       --host 0.0.0.0 --port 30000
   echo "started: $NAME (port $PORT, api-key=rjman, model=local, $SCENARIO_NOTE, concurrency=$CONCURRENT)"
-  _dash="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/dashboard/dashboard.sh"
+  _profiles_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  echo "sglang:$SCENARIO" > "$_profiles_dir/watchdog/.last-engine" 2>/dev/null || true
+  _dash="$_profiles_dir/dashboard/dashboard.sh"
   [ -f "$_dash" ] && bash "$_dash" start || true
 }
 

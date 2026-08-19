@@ -35,7 +35,9 @@ start() {
   echo "started: $NAME (port $PORT, api-key: rjman, restart=always)"
   echo "log:   bash $0 logs"
   echo "stop:  bash $0 stop"
-  _dash="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/dashboard/dashboard.sh"
+  _profiles_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  echo "vllm" > "$_profiles_dir/watchdog/.last-engine" 2>/dev/null || true
+  _dash="$_profiles_dir/dashboard/dashboard.sh"
   [ -f "$_dash" ] && bash "$_dash" start || true
 }
 

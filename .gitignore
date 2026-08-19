@@ -4,6 +4,10 @@
 # runtime logs
 *.log
 
+# watchdog runtime state (which engine to auto-restart)
+profiles/watchdog/.last-engine
+profiles/watchdog/.idle-state
+
 # python bytecode (dashboard.py runs in place)
 __pycache__/
 *.pyc
