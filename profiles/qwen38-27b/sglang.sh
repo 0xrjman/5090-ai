@@ -3,9 +3,13 @@
 # ckpt (HF): RadixArk (base: Qwen/Qwen3.8-27B) [confirm exact repo id on HF]
 # refetch:   hf download <RadixArk/Qwen3.8-27B-NVFP4> --local-dir /home/rjman/models/qwen3.8-27b-nvfp4-radixark
 #
-# draft (HF): z-lab/Qwen3.8-27B-DFlash2 (block-diffusion drafter, for SPEC_METHOD=dflash)
+# draft (HF): z-lab/Qwen3.8-27B-DFlash2 (block-diffusion drafter, for SPEC_METHOD=dflash -- BROKEN, see profiles/README.md)
 # refetch:    HF_ENDPOINT=https://hf-mirror.com hf download z-lab/Qwen3.8-27B-DFlash2 \
 #               --local-dir /home/rjman/models/qwen3.8-27b-dflash2
+#
+# MTP (SPEC_METHOD=mtp): uses the in-checkpoint MTP head, no separate draft
+# download -- this is sglang's official recipe for this checkpoint per
+# https://github.com/sgl-project/sglang/blob/main/docs/cookbook/autoregressive/Qwen/Qwen3.8-27B.mdx
 #
 # scenarios (mutually exclusive, one 27B fits the 32GB):
 #   main    concurrency=2  --max-mamba-cache-size 8
@@ -17,7 +21,7 @@ IMG=lmsysorg/sglang:qwen38-27b
 MODEL=/home/rjman/models/qwen3.8-27b-nvfp4-radixark
 PORT=8020
 
-SPEC_METHOD="${SPEC_METHOD:-dflash}"   # dflash (default) | none
+SPEC_METHOD="${SPEC_METHOD:-mtp}"   # mtp (default) | none | dflash (broken, see profiles/README.md)
 DFLASH_DIR="${DFLASH_DIR:-/home/rjman/models/qwen3.8-27b-dflash2}"
 DFLASH_NUM_SPEC="${DFLASH_NUM_SPEC:-8}"
 
@@ -29,14 +33,19 @@ fi
 
 DFLASH_MOUNT=()
 SPEC_ARGS=()
+MAMBA_CACHE_STRATEGY=extra_buffer_lazy
 case "$SPEC_METHOD" in
   dflash)
     DFLASH_MOUNT=(-v "$DFLASH_DIR":/draft:ro)
     SPEC_ARGS=(--speculative-algorithm DFLASH --speculative-draft-model-path /draft --speculative-num-draft-tokens "$DFLASH_NUM_SPEC")
+    MAMBA_CACHE_STRATEGY=extra_buffer   # DFLASH doesn't support extra_buffer_lazy
+    ;;
+  mtp)
+    SPEC_ARGS=(--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --enable-linear-replayssm-spec)
     ;;
   none) ;;
   *)
-    echo "unknown SPEC_METHOD: $SPEC_METHOD (expected dflash|none)" >&2
+    echo "unknown SPEC_METHOD: $SPEC_METHOD (expected mtp|none|dflash)" >&2
     exit 1
     ;;
 esac
@@ -68,7 +77,7 @@ start() {
       --mem-fraction-static 0.95 \
       --attention-backend flashinfer \
       --chunked-prefill-size 2048 \
-      --mamba-radix-cache-strategy extra_buffer_lazy \
+      --mamba-radix-cache-strategy "$MAMBA_CACHE_STRATEGY" \
       --max-mamba-cache-size "$MAMBA_CACHE" \
       --reasoning-parser qwen3 \
       --tool-call-parser qwen3_coder \

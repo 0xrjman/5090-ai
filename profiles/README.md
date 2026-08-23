@@ -61,11 +61,38 @@ profiles/dashboard/dashboard.sh [start|stop|status|logs]
   build's model registry. `vllm.sh` now defaults to `SPEC_METHOD=mtp`;
   `SPEC_METHOD=dflash` is left switchable only in case a future vLLM image adds
   support — don't flip the default back without re-testing on the actual image.
-- `sglang.sh` still defaults to `SPEC_METHOD=dflash` (uses sglang's native
-  `--speculative-algorithm DFLASH` flag, a different code path from vLLM's
-  `--speculative-config`) and has **not yet been throughput/startup-tested**
-  with the real weights on this box — the vllm.sh failure above does not imply
-  sglang.sh is broken too, but don't trust it until it's actually been started
-  and measured. Weights live at `/home/rjman/data/models/qwen3.8-27b-dflash2`
-  (real files) with `/home/rjman/models/qwen3.8-27b-dflash2` symlinked to the
-  same dir — no need to re-download for sglang.
+- **`sglang.sh` DFlash2 is also broken, do not default to it.** Measured
+  2026-08-19 on `lmsysorg/sglang:qwen38-27b` (digest
+  `sha256:febfb971c7352570fc445c466ebd6ffc9d896024958e544a60f2137fd85856b1`)
+  with the real `z-lab/Qwen3.8-27B-DFlash2` weights mounted: after fixing an
+  unrelated startup assertion (`--mamba-radix-cache-strategy extra_buffer_lazy`
+  is incompatible with `--speculative-algorithm DFLASH`; must be
+  `extra_buffer` — `sglang.sh` now sets this conditionally), sglang crashes
+  while loading the draft model with
+  `ValueError: Cannot find model module. 'DFlash2DraftModel' is not a
+  registered model in the Transformers library ... and 'AutoModel' is not
+  present in the model config's 'auto_map'`, then crash-loops under
+  `--restart=always`. Same root cause category as the vLLM failure above: the
+  draft checkpoint's `config.json` declares `architectures:
+  ["DFlash2DraftModel"]` with no `auto_map` and no `modeling_*.py` in the repo
+  (`/home/rjman/models/qwen3.8-27b-dflash2` only has `config.json` +
+  `model.safetensors`), so it relies entirely on the inference engine having
+  that exact class built into its model registry — and this sglang build
+  doesn't, despite accepting the `--speculative-algorithm DFLASH` flag itself.
+  **Conclusion: DFlash2 for this checkpoint is deprecated on this box — do not
+  use it.** Two independent reasons:
+  1. *Startup (measured above):* it doesn't even load on this vLLM or sglang
+     build because the draft's `DFlash2DraftModel` isn't in the engine's model
+     registry.
+  2. *VRAM (the primary deprecation reason):* even where the draft model does
+     load, the DFlash2 draft occupies VRAM that would otherwise go to the KV
+     cache, so usable context shrinks too much to be practical. That context
+     loss makes it a weak fit for this single-27B-on-32GB box — low
+     usability, so it's abandoned for now.
+  `sglang.sh` now defaults to `SPEC_METHOD=mtp` (the in-checkpoint MTP head, no
+  separate draft download, so no draft-model VRAM cost); `SPEC_METHOD=dflash`
+  is left switchable only in case a future sglang image registers this
+  architecture — don't flip the default back without re-testing on the actual
+  image. Weights live at
+  `/home/rjman/data/models/qwen3.8-27b-dflash2` (real files) with
+  `/home/rjman/models/qwen3.8-27b-dflash2` symlinked to the same dir.
