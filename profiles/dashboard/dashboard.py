@@ -194,16 +194,29 @@ def gpu_stat():
     dict or None if nvidia-smi is unavailable. ~20ms, called every 2nd poll."""
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,power.draw,power.limit",
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,power.draw,power.limit,temperature.gpu,fan.speed",
              "--format=csv,noheader,nounits"],
             stdout=subprocess.PIPE, text=True, timeout=3).stdout.strip()
         if not out:
             return None
-        u, mu, mt, pw, pl = (x.strip() for x in out.split(",")[:5])
+        u, mu, mt, pw, pl, tc, fan = (x.strip() for x in out.split(",")[:7])
         return {"util": _i(u), "mem_used": _i(mu), "mem_total": _i(mt),
-                "power_w": _f(pw), "power_limit_w": _f(pl), "ts": time.time()}
+                "power_w": _f(pw), "power_limit_w": _f(pl),
+                "temp_c": _f(tc), "fan_pct": _i(fan), "ts": time.time()}
     except Exception:
         return None
+
+
+def cpu_temp():
+    """CPU package temp (°C) from the x86_pkg_temp thermal zone; None if absent."""
+    for i in range(32):
+        try:
+            z = f"/sys/class/thermal/thermal_zone{i}"
+            if open(z + "/type").read().strip() == "x86_pkg_temp":
+                return round(int(open(z + "/temp").read().strip()) / 1000, 1)
+        except OSError:
+            pass
+    return None
 
 
 def pull_lines(st, name, tail):
@@ -272,6 +285,9 @@ class Store:
         self.docker_ok = True
         self.gpu = deque(maxlen=120)   # (ts, util_pct) recent samples for a trend sparkline
         self.gpu_now = None            # latest full nvidia-smi snapshot
+        self.therm = deque(maxlen=2400)   # (ts, gpu_c, cpu_c, gpu_w, fan_pct) ~1h at 1.5s
+        self.therm_db_ts = 0.0
+        self.therm_prune_ts = 0.0
         self.boot = time.time()
         self.lock = threading.Lock()
 
@@ -347,6 +363,8 @@ def init_db(path=DB_PATH):
     CREATE INDEX IF NOT EXISTS idx_req_ts ON requests(ts);
     CREATE UNIQUE INDEX IF NOT EXISTS uq_tp_fp ON throughput(fp);
     CREATE UNIQUE INDEX IF NOT EXISTS uq_req_fp ON requests(fp);
+    CREATE TABLE IF NOT EXISTS thermal(
+      ts REAL PRIMARY KEY, gpu_c REAL, cpu_c REAL, gpu_w REAL, gpu_fan INTEGER);
     """)
     for t in ("throughput", "requests"):
         if "fp" not in [r[1] for r in conn.execute(f"PRAGMA table_info({t})")]:
@@ -425,10 +443,33 @@ def poll_loop(st, tail, conn):
                                 st.ingest(ev, now)
                             record(conn, name, st.framework, evs)
         g = gpu_stat()
+        ct = cpu_temp()
+        therm = None
+        prune_therm = None
         if g is not None:
             with st.lock:
                 st.gpu_now = g
                 st.gpu.append((now, g["util"]))
+                if g.get("temp_c") is not None or ct is not None:
+                    st.therm.append((now, g.get("temp_c"), ct, g.get("power_w"), g.get("fan_pct")))
+                    if now - st.therm_db_ts >= 5:
+                        st.therm_db_ts = now
+                        therm = (now, g.get("temp_c"), ct, g.get("power_w"), g.get("fan_pct"))
+                if now - st.therm_prune_ts >= 300:
+                    st.therm_prune_ts = now
+                    prune_therm = now - 3600
+        if therm is not None:
+            try:
+                conn.execute("INSERT OR REPLACE INTO thermal(ts,gpu_c,cpu_c,gpu_w,gpu_fan) VALUES(?,?,?,?,?)", therm)
+                conn.commit()
+            except sqlite3.Error:
+                pass
+        if prune_therm is not None:
+            try:
+                conn.execute("DELETE FROM thermal WHERE ts < ?", (prune_therm,))
+                conn.commit()
+            except sqlite3.Error:
+                pass
         time.sleep(POLL)
 
 
@@ -504,8 +545,10 @@ def build_state(st, window):
         active = [s for s in tp_win if (s["running"] or 0) > 0]
 
         tp_metrics = {
-            "avg_decode": _mean(dec), "peak_decode": round(max(dec), 1) if dec else None,
-            "avg_prefill": _mean(pre), "peak_prefill": round(max(pre), 1) if pre else None,
+            "avg_decode": _mean([v for v in dec if (v or 0) > 0]),
+            "peak_decode": round(max(dec), 1) if dec else None,
+            "avg_prefill": _mean([v for v in pre if (v or 0) > 0]),
+            "peak_prefill": round(max(pre), 1) if pre else None,
             "active_pct": round(100.0 * len(active) / len(tp_win), 1) if tp_win else None,
             "samples": len(tp_win),
         }
@@ -587,8 +630,8 @@ def build_state(st, window):
         # resolved device pool; the numerator is an estimate (the log exposes live
         # concurrency but not live per-stream context), so it is labeled as such.
         ap = _mean(prompt) if done else None
-        _buckets = [(0, 32768, "<32k"), (32768, 65536, "32-64k"), (65536, 98304, "64-96k"),
-                    (98304, 131072, "96-128k"), (131072, 10**12, "128k+")]
+        _buckets = [(0, 30000, "0-30K"), (30000, 60000, "30-60K"), (60000, 100000, "60-100K"),
+                    (100000, 150000, "100-150K"), (150000, 10**12, "160K+")]
         ctx_hist = []
         for _lo, _hi, _lab in _buckets:
             _b = [r for r in done if r["prompt"] is not None and _lo <= r["prompt"] < _hi]
@@ -638,6 +681,16 @@ def build_state(st, window):
     pre_vals = [p[2] for p in series]
     peak = max([max(dec_vals) if dec_vals else 0, max(pre_vals) if pre_vals else 0], default=0)
 
+    therm_win = [p for p in st.therm if p[0] >= now - window]
+    t_now = st.therm[-1] if st.therm else None
+    thermal = {
+        "now": ({"gpu_c": t_now[1], "cpu_c": t_now[2], "gpu_w": t_now[3],
+                 "fan_pct": t_now[4]} if t_now else {}),
+        "series": _downsample(therm_win),
+        "max_gpu": round(max((p[1] for p in therm_win if p[1] is not None), default=0) or None, 1),
+        "max_cpu": round(max((p[2] for p in therm_win if p[2] is not None), default=0) or None, 1),
+    }
+
     return {
         "server": {"now": round(now, 3), "last_poll": round(st.last_poll, 3),
                    "boot": round(boot, 3), "poll": POLL, "docker_ok": docker_ok},
@@ -647,6 +700,7 @@ def build_state(st, window):
                       "has_parser": framework in PARSERS,
                       "per_request": framework in PER_REQUEST},
         "gpu": {"now": gpu_now, "series": gpu_series},
+        "thermal": thermal,
         "window": window,
         "live": live,
         "tp": tp_metrics,
@@ -792,6 +846,15 @@ code{font-family:var(--mono);font-size:.92em}
 .wins button:hover{color:var(--txt)}
 .wins button.on{background:var(--grad);color:#fff;box-shadow:0 2px 10px rgba(124,123,255,.4)}
 .meta{font-size:11.5px;color:var(--dim);font-family:var(--mono)}
+.therm{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11.5px;
+  padding:5px 12px;border-radius:999px;border:1px solid var(--border-2);background:var(--panel);
+  color:var(--muted);white-space:nowrap}
+.therm .tdot{width:7px;height:7px;border-radius:50%;background:var(--run);flex:none}
+.therm.warn{color:#f5c064;border-color:rgba(245,165,36,.4)}
+.therm.warn .tdot{background:var(--pre)}
+.therm.hot{color:#ff97a2;border-color:rgba(255,107,122,.5);animation:thermpulse 2s ease-in-out infinite}
+.therm.hot .tdot{background:var(--err)}
+@keyframes thermpulse{50%{box-shadow:0 0 14px rgba(255,107,122,.45)}}
 .badge{display:inline-flex;align-items:center;gap:6px;border-radius:8px;padding:5px 11px;font-size:11.5px;
   font-family:var(--mono);font-weight:500;border:1px solid var(--border);background:var(--panel-2);color:var(--muted);
   text-transform:uppercase;letter-spacing:.03em}
@@ -799,7 +862,7 @@ code{font-family:var(--mono);font-size:.92em}
 .badge.busy{color:var(--run);border-color:rgba(47,214,160,.32);background:rgba(47,214,160,.09)}
 .badge.idle{color:var(--muted);background:rgba(255,255,255,.02)}
 .badge.pending{color:var(--pre);border-color:rgba(245,165,36,.32);background:rgba(245,165,36,.09)}
-.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:14px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:0}
 .card{background:linear-gradient(180deg,var(--panel-2),var(--panel));border:1px solid var(--border);border-radius:14px;
   padding:15px 16px;position:relative;overflow:hidden;transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
 .card:hover{transform:translateY(-3px);border-color:var(--border-2);box-shadow:0 14px 34px rgba(0,0,0,.45)}
@@ -874,9 +937,10 @@ canvas.conc{height:150px}
 .sdone .d .rid{color:var(--txt);font-weight:650}
 .sdone .d .m{color:var(--muted)}
 .sdone .d .wall{font-weight:700;font-variant-numeric:tabular-nums}
-.loadrow{display:grid;grid-template-columns:230px 1fr 1fr;gap:20px;align-items:start}
+.loadrow{display:grid;grid-template-columns:230px 1fr 1fr;gap:20px;align-items:stretch}
 @media(max-width:1000px){.loadrow{grid-template-columns:1fr}}
 .loadcol{display:flex;flex-direction:column;gap:16px}
+.loadchart{display:flex;flex-direction:column}
 .loadcol .kvbox{flex:1}
 .spark{display:block;width:100%;height:30px;margin-top:9px}
 .kvbox{background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:12px;padding:14px 15px}
@@ -896,16 +960,50 @@ canvas.conc{height:150px}
 .kvmini .n{font-family:var(--mono);font-weight:600;font-size:13px}
 .subhead2{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:600;margin-bottom:8px}
 .subhead2 .dim{color:var(--dim);text-transform:none;letter-spacing:0;font-weight:400}
-canvas.hist,canvas.scatter{height:170px}
+canvas.hist,canvas.scatter{height:auto;min-height:170px;flex:1}
 .hleg{display:flex;flex-wrap:wrap;gap:3px 14px;margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--muted)}
 .empty{color:var(--dim);font-family:var(--mono);font-size:12.5px;padding:16px 4px}
-footer{margin-top:18px;color:var(--dim);font-size:11.5px;font-family:var(--mono);line-height:1.9;
-  display:flex;align-items:center;gap:7px;flex-wrap:wrap}
-footer code{background:rgba(255,255,255,.05);border:1px solid var(--border);padding:1px 6px;border-radius:5px}
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--panel-3);border-radius:6px}
 ::-webkit-scrollbar-thumb:hover{background:#2a2f4d}
+.shell{display:flex;gap:14px;align-items:stretch;margin-top:14px}
+.sidebar{flex:0 0 auto;width:192px;background:linear-gradient(180deg,var(--panel-2),var(--panel));
+  border:1px solid var(--border);border-radius:16px;padding:11px;display:flex;flex-direction:column;gap:4px;
+  position:sticky;top:16px;transition:width .22s ease}
+.sidebar.collapsed{width:64px}
+.sb-h{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:2px 4px 6px}
+.sb-title{font-size:10.5px;color:var(--dim);font-family:var(--mono);text-transform:uppercase;letter-spacing:.08em;font-weight:600}
+.sidebar.collapsed .sb-title{display:none}
+.sb-toggle{background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:7px;width:24px;height:24px;
+  cursor:pointer;display:grid;place-items:center;font-size:10px;flex:0 0 auto;transition:color .15s,border-color .15s;padding:0}
+.sb-toggle:hover{color:var(--txt);border-color:var(--border-2)}
+.sb-nav{display:flex;flex-direction:column;gap:5px}
+.tab{display:flex;align-items:center;gap:10px;background:transparent;border:1px solid transparent;color:var(--muted);
+  border-radius:10px;padding:9px 11px;cursor:pointer;font-size:13px;font-weight:500;font-family:var(--sans);
+  transition:background .15s,color .15s;text-align:left;width:100%;white-space:nowrap}
+.tab:hover{background:rgba(255,255,255,.03);color:var(--txt)}
+.tab.on{background:var(--grad);color:#fff;box-shadow:0 2px 12px rgba(124,123,255,.35);border-color:transparent}
+.tic{font-size:16px;width:20px;text-align:center;flex:0 0 auto}
+.sidebar.collapsed .tab{justify-content:center;padding:10px}
+.sidebar.collapsed .tablabel{display:none}
+.content{flex:1 1 auto;min-width:0}
+.tabpane{display:none}
+.tabpane.active{display:block}
+.tabpane.active.row{display:grid}
+@media(max-width:900px){
+  .shell{flex-direction:column}
+  .sidebar{width:100%!important;position:static;flex-direction:row;align-items:center;gap:8px;overflow-x:auto}
+  .sidebar.collapsed{width:100%}
+  .sb-h{padding:0}
+  .sb-nav{flex-direction:row;flex:1}
+  .tab{width:auto}
+  .sidebar.collapsed .tab{padding:9px 11px}
+}
+.ctip{position:fixed;z-index:60;pointer-events:none;display:none;background:var(--panel-3);
+  border:1px solid var(--border-2);border-radius:9px;padding:7px 10px;font-family:var(--mono);
+  font-size:11.5px;color:var(--txt);box-shadow:0 10px 28px rgba(0,0,0,.55);line-height:1.55;white-space:nowrap}
+.ctip b{font-weight:600}
 </style>
 </head>
 <body>
@@ -919,11 +1017,21 @@ footer code{background:rgba(255,255,255,.05);border:1px solid var(--border);padd
     <span class="chip" id="chip"><b>&mdash;</b></span>
     <span class="badge" id="badge">&mdash;</span>
     <div class="spacer"></div>
+    <span class="therm" id="therm" title="GPU ≥78° warn / ≥88° hot · CPU ≥85° warn / ≥95° hot"><i class="tdot"></i><span id="therm_txt">–</span></span>
     <div class="wins" id="wins"></div>
     <span class="meta" id="meta"></span>
   </div>
 
-  <div class="grid">
+  <div class="shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="sb-h">
+        <span class="sb-title">Sections</span>
+        <button class="sb-toggle" id="sb_toggle" title="Toggle sidebar">&#9664;</button>
+      </div>
+      <nav class="sb-nav" id="sb_nav"></nav>
+    </aside>
+    <div class="content">
+    <div class="grid">
     <div class="card dec"><div class="ct"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></span><span class="k">Decode TPS</span><span class="ks">now</span></div><div class="cv" id="c_dec">-</div><div class="cu">tokens/s<canvas id="spark_dec"></canvas></div></div>
     <div class="card dec"><div class="ct"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></span><span class="k">Decode TPS</span><span class="ks">avg</span></div><div class="cv" id="c_dec_avg">-</div><div class="cu" id="u_dec_avg">window</div></div>
     <div class="card dec"><div class="ct"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></span><span class="k">Decode TPS</span><span class="ks">peak</span></div><div class="cv" id="c_dec_peak">-</div><div class="cu" id="u_dec_peak">window</div></div>
@@ -934,13 +1042,19 @@ footer code{background:rgba(255,255,255,.05);border:1px solid var(--border);padd
     <div class="card"><div class="ct"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14 8 8"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg></span><span class="k">GPU active</span><span class="ks">window</span></div><div class="cv" id="c_active">-</div><div class="cu">of window</div></div>
   </div>
 
-  <div class="panel">
+  <div class="panel tabpane active" id="tp-throughput" data-tab="throughput">
     <div class="ph"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg></span><h2>Throughput</h2><span class="note" id="chart_note">tokens/s</span></div>
     <canvas id="chart"></canvas>
-    <div class="legend"><span><i style="background:var(--dec)"></i>decode (generation)</span><span><i style="background:var(--pre)"></i>prefill</span></div>
+    <div class="legend"><span><i style="background:var(--dec)"></i>decode (generation)</span><span><i style="background:var(--pre)"></i>prefill</span><span class="dim">left=decode · right=prefill, auto-scaled</span></div>
   </div>
 
-  <div class="row">
+  <div class="panel tabpane" id="tp-therm" data-tab="therm">
+    <div class="ph"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg></span><h2>Thermal</h2><span class="note" id="therm_note">°C</span></div>
+    <canvas id="therm_chart"></canvas>
+    <div class="legend"><span><i style="background:var(--dec)"></i>GPU core °C</span><span><i style="background:var(--pre)"></i>CPU package °C</span><span class="dim" id="therm_fan"></span></div>
+  </div>
+
+  <div class="row tabpane" id="tp-streams" data-tab="streams">
     <div class="panel">
       <div class="ph"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg></span><h2>Concurrent streams</h2><span class="note" id="stream_note"></span></div>
       <div class="streams" id="streams"></div>
@@ -954,7 +1068,7 @@ footer code{background:rgba(255,255,255,.05);border:1px solid var(--border);padd
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel tabpane" id="tp-load" data-tab="load">
     <div class="ph"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="10" width="3" height="7" rx="1"/><rect x="12" y="6" width="3" height="11" rx="1"/><rect x="17" y="13" width="3" height="4" rx="1"/></svg></span><h2>Load &middot; KV &middot; context</h2><span class="note" id="load_note"></span></div>
     <div class="loadrow">
       <div class="loadcol">
@@ -981,7 +1095,7 @@ footer code{background:rgba(255,255,255,.05);border:1px solid var(--border);padd
     </div>
   </div>
 
-  <div class="row">
+  <div class="row tabpane" id="tp-req" data-tab="req">
     <div class="panel">
       <div class="ph"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg></span><h2>Requests</h2><span class="note" id="req_note"></span></div>
       <div class="kv" id="req_kv"></div>
@@ -998,27 +1112,24 @@ footer code{background:rgba(255,255,255,.05);border:1px solid var(--border);padd
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel tabpane" id="tp-recent" data-tab="recent">
     <div class="ph"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3h18v18H3z"/><path d="M3 9h18M9 3v18"/></svg></span><h2>Recent requests</h2><span class="note">last 30 · newest first</span></div>
     <div style="overflow-x:auto"><table><thead><tr><th>time</th><th>req</th><th>finish</th><th>prompt</th><th>gen</th><th>ttft</th><th>dec/s</th><th>wall</th><th>mtp</th></tr></thead><tbody id="req_rows"></tbody></table></div>
   </div>
 
-  <div class="panel">
+  <div class="panel tabpane" id="tp-log" data-tab="log">
     <div class="ph"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg></span><h2>Raw log</h2><span class="note">newest first · live tail</span></div>
     <div class="log" id="log"></div>
   </div>
-
-  <footer>
-    <span>source: <span id="f_src">docker logs</span> · engine API · poll <span id="f_poll">-</span>s</span>
-    <span>·</span><span>window metrics recompute live</span>
-    <span>·</span><span>NInfer / vLLM supported — SGLang: add a parser in <code>dashboard.py::PARSERS</code></span>
-  </footer>
+    </div>
+  </div>
 </div>
 
 <script>
 const WINS=[[60,"1m"],[300,"5m"],[900,"15m"],[3600,"1h"]];
 let win=300;
 const $=id=>document.getElementById(id);
+let LAST=null;
 function fmt(v,d=1){return v==null?"-":(+v).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});}
 function fmt0(v){return v==null?"-":Math.round(v).toLocaleString();}
 function tstr(t){return t==null?"-":new Date(t*1000).toLocaleTimeString([],{hour12:false});}
@@ -1026,6 +1137,10 @@ function ms(v){if(v==null)return "-";return v>=1000?fmt(v/1000,2)+"s":Math.round
 
 const C={dec:'#5b93ff',pre:'#f5a524',run:'#2fd6a0',wait:'#37c6f0',err:'#ff6b7a',
   grid:'rgba(150,160,190,.09)',label:'#5c6478',dim:'#5c6478',muted:'#9aa3b8'};
+const CTXC=['#37d39f','#37c6f0','#5b93ff','#f5a524','#ff6b7a'];
+const CTXL=['0-30K','30-60K','60-100K','100-150K','160K+'];
+function ctxBand(n){return n==null?-1:n<30000?0:n<60000?1:n<100000?2:n<150000?3:4;}
+function ctxColor(n){const i=ctxBand(n);return i<0?'#9aa3b8':CTXC[i];}
 function hexA(hex,a){const h=hex.replace('#','');const s=h.length===3?h.split('').map(c=>c+c).join(''):h;
   const n=parseInt(s,16);return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`;}
 function smoothPath(x,pts){
@@ -1066,6 +1181,7 @@ function drawSpark(id,vals,color){
   const g=x.createLinearGradient(0,0,0,H);g.addColorStop(0,hexA(color,.42));g.addColorStop(1,hexA(color,0));
   x.beginPath();smoothPath(x,P);x.lineTo(P[P.length-1][0],H);x.lineTo(P[0][0],H);x.closePath();x.fillStyle=g;x.fill();
   x.beginPath();smoothPath(x,P);x.strokeStyle=color;x.lineWidth=1.5;x.lineJoin='round';x.lineCap='round';x.stroke();
+  c._pts=P.map((q,i)=>({x:q[0],y:q[1],html:fmt(vals[i])}));bindTip(c,"dist");
 }
 function drawSpark100(id,vals,color){
   const c=$(id);if(!c||!c.clientWidth)return;
@@ -1079,6 +1195,7 @@ function drawSpark100(id,vals,color){
   const g=x.createLinearGradient(0,0,0,H);g.addColorStop(0,hexA(color,.42));g.addColorStop(1,hexA(color,0));
   x.beginPath();smoothPath(x,P);x.lineTo(P[P.length-1][0],H);x.lineTo(P[0][0],H);x.closePath();x.fillStyle=g;x.fill();
   x.beginPath();smoothPath(x,P);x.strokeStyle=color;x.lineWidth=1.5;x.lineJoin='round';x.lineCap='round';x.stroke();
+  c._pts=P.map((q,i)=>({x:q[0],y:q[1],html:Math.round(vals[i]==null?0:vals[i])+"%"}));bindTip(c,"dist");
 }
 
 function buildWins(){
@@ -1095,24 +1212,81 @@ function kv(rows){
 function finishCol(f){if(!f)return C.muted;if(/cancel|error/i.test(f))return C.err;if(/limit|length/i.test(f))return C.pre;return C.dec;}
 function mtpCell(m){if(m==null)return'-';const col=m>=70?C.run:m>=40?C.pre:C.dim;return `<span style="color:${col}">${fmt(m,1)}%</span>`;}
 
+let tipEl=null;
+function ensureTip(){if(!tipEl){tipEl=document.createElement("div");tipEl.className="ctip";document.body.appendChild(tipEl);}return tipEl;}
+function showTip(cx,cy,html){const t=ensureTip();t.innerHTML=html;t.style.display="block";
+  const tw=t.offsetWidth,th=t.offsetHeight;let px=cx+14,py=cy+14;
+  if(px+tw>window.innerWidth-8)px=cx-tw-14;if(py+th>window.innerHeight-8)py=cy-th-14;
+  t.style.left=px+"px";t.style.top=py+"px";}
+function hideTip(){if(tipEl)tipEl.style.display="none";}
+function bindTip(c,mode){if(c._tip)return;c._tip=1;
+  c.addEventListener("mousemove",e=>{
+    const r=c.getBoundingClientRect();const mx=e.clientX-r.left,my=e.clientY-r.top;
+    const pts=c._pts||[];if(!pts.length){hideTip();return;}
+    let best=null,bd=mode==="x"?45:18*18;
+    if(mode==="x"){const lim=45;for(const p of pts){const d=Math.abs(mx-p.x);if(d<lim&&d<bd){bd=d;best=p;}}}
+    else{for(const p of pts){const dx=mx-p.x,dy=my-p.y,d=dx*dx+dy*dy;if(d<bd){bd=d;best=p;}}}
+    if(best)showTip(e.clientX,e.clientY,best.html);else hideTip();
+  });
+  c.addEventListener("mouseleave",hideTip);}
+
 function drawChart(series,peak,w,now){
   const c=$("chart");const dpr=window.devicePixelRatio||1;
   const W=c.clientWidth,H=220;c.width=W*dpr;c.height=H*dpr;
   const x=c.getContext("2d");x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,W,H);
-  const padL=46,padR=12,padT=12,padB=22;
+  const padL=46,padR=46,padT=12,padB=22;
   const cw=W-padL-padR,ch=H-padT-padB;
-  const yv=Math.max(10,peak);
   const t1=now,t0=now-w;
-  x.font="10px ui-monospace, monospace";x.lineWidth=1;x.strokeStyle=C.grid;x.fillStyle=C.label;
-  for(let g=0;g<=4;g++){const val=yv*g/4,y=padT+ch-ch*g/4;
-    x.beginPath();x.moveTo(padL,y);x.lineTo(W-padR,y);x.stroke();x.fillText(Math.round(val),4,y+3);}
+  const inw=(series||[]).filter(p=>p[0]>=t0&&p[0]<=t1);
+  let decPeak=0,prePeak=0;
+  for(const p of inw){if((p[1]||0)>decPeak)decPeak=p[1];if((p[2]||0)>prePeak)prePeak=p[2];}
+  const decYv=Math.max(10,decPeak),preYv=Math.max(10,prePeak);
+  x.font="10px ui-monospace, monospace";x.lineWidth=1;
+  for(let g=0;g<=4;g++){const y=padT+ch-ch*g/4;
+    x.strokeStyle=C.grid;x.beginPath();x.moveTo(padL,y);x.lineTo(W-padR,y);x.stroke();
+    x.fillStyle=C.dec;x.fillText(String(Math.round(decYv*g/4)),4,y+3);
+    x.fillStyle=C.pre;x.fillText(String(Math.round(preYv*g/4)),W-padR+5,y+3);}
+  x.fillStyle=C.label;
   for(let g=0;g<=4;g++){const tt=t0+w*g/4,px=padL+cw*g/4;x.fillText(tstr(tt).slice(0,5),px-13,H-6);}
-  if(!series||series.length<2){x.fillStyle=C.dim;x.fillText("waiting for samples…",padL+10,padT+22);return;}
+  if(inw.length<2){x.fillStyle=C.dim;x.fillText("waiting for samples…",padL+10,padT+22);return;}
   const X=t=>padL+cw*((t-t0)/w);
-  const Y=v=>padT+ch-ch*Math.min(v,yv)/yv;
-  const inw=series.filter(p=>p[0]>=t0&&p[0]<=t1);
-  areaAndLine(x,inw.map(p=>[X(p[0]),Y(p[2])]),C.pre,padT,ch,false);
-  areaAndLine(x,inw.map(p=>[X(p[0]),Y(p[1])]),C.dec,padT,ch,true);
+  const Ydec=v=>padT+ch-ch*Math.min(v,decYv)/decYv;
+  const Ypre=v=>padT+ch-ch*Math.min(v,preYv)/preYv;
+  areaAndLine(x,inw.map(p=>[X(p[0]),Ypre(p[2])]),C.pre,padT,ch,false);
+  areaAndLine(x,inw.map(p=>[X(p[0]),Ydec(p[1])]),C.dec,padT,ch,true);
+  c._pts=inw.map(p=>({x:X(p[0]),html:`<b>${tstr(p[0])}</b><br>`+
+    `<span style="color:${C.dec}">decode ${fmt(p[1])} (left axis)</span><br>`+
+    `<span style="color:${C.pre}">prefill ${fmt(p[2])} (right axis)</span>`}));
+  bindTip(c,"x");
+}
+
+function drawTherm(series,w,now){
+  const c=$("therm_chart");if(!c)return;const dpr=window.devicePixelRatio||1;
+  const W=c.clientWidth,H=220;c.width=W*dpr;c.height=H*dpr;
+  const x=c.getContext("2d");x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,W,H);
+  const padL=42,padR=12,padT=12,padB=22;
+  const cw=W-padL-padR,ch=H-padT-padB;
+  const t1=now,t0=now-w;
+  const inw=(series||[]).filter(p=>p[0]>=t0&&p[0]<=t1);
+  let hi=0;
+  for(const p of inw)for(const i of [1,2])if(p[i]!=null&&p[i]>hi)hi=p[i];
+  const lo=40,hi2=Math.max(45,Math.ceil((hi+3)/5)*5);
+  x.font="10px ui-monospace, monospace";x.lineWidth=1;
+  for(let g=0;g<=4;g++){const val=lo+(hi2-lo)*g/4,y=padT+ch-ch*g/4;
+    x.strokeStyle=C.grid;x.beginPath();x.moveTo(padL,y);x.lineTo(W-padR,y);x.stroke();
+    x.fillStyle=C.label;x.fillText(Math.round(val)+"°",4,y+3);}
+  for(let g=0;g<=4;g++){const tt=t0+w*g/4,px=padL+cw*g/4;x.fillStyle=C.label;x.fillText(tstr(tt).slice(0,5),px-13,H-6);}
+  if(inw.length<2){x.fillStyle=C.dim;x.fillText("collecting…",padL+10,padT+22);return;}
+  const X=t=>padL+cw*((t-t0)/w);
+  const Y=v=>padT+ch-ch*(Math.min(Math.max(v,lo),hi2)-lo)/(hi2-lo);
+  const gpts=inw.filter(p=>p[1]!=null).map(p=>[X(p[0]),Y(p[1])]);
+  const cpts=inw.filter(p=>p[2]!=null).map(p=>[X(p[0]),Y(p[2])]);
+  if(cpts.length>1)areaAndLine(x,cpts,C.pre,padT,ch,false);
+  if(gpts.length>1)areaAndLine(x,gpts,C.dec,padT,ch,true);
+  c._pts=inw.map(p=>({x:X(p[0]),html:`<b>${tstr(p[0])}</b><br>`+
+    `<span style="color:${C.dec}">GPU ${p[1]==null?"-":Math.round(p[1])+"°"}</span><br>`+
+    `<span style="color:${C.pre}">CPU ${p[2]==null?"-":Math.round(p[2])+"°"}</span>`}));
+  bindTip(c,"x");
 }
 
 function drawConc(series,w,now){
@@ -1135,33 +1309,44 @@ function drawConc(series,w,now){
   areaAndLine(x,mk(1),C.run,padT,ch,true);
   function thin(pts,color){x.beginPath();smoothPath(x,pts);x.lineJoin='round';x.lineCap='round';x.strokeStyle=color;x.lineWidth=1.5;x.stroke();}
   thin(mk(3),C.wait);thin(mk(2),C.pre);
+  c._pts=inw.map(p=>({x:X(p[0]),html:`<b>${tstr(p[0])}</b><br>`+
+    `<span style="color:${C.run}">running ${p[1]==null?0:p[1]}</span><br>`+
+    `<span style="color:${C.pre}">prefilling ${p[2]==null?0:p[2]}</span><br>`+
+    `<span style="color:${C.wait}">waiting ${p[3]==null?0:p[3]}</span>`}));
+  bindTip(c,"x");
 }
 
 function drawHistogram(buckets){
   const c=$("hist_chart");const dpr=window.devicePixelRatio||1;
-  const W=c.clientWidth,H=170;c.width=W*dpr;c.height=H*dpr;
+  const W=c.clientWidth,H=Math.max(c.clientHeight||170,170);c.width=W*dpr;c.height=H*dpr;
   const x=c.getContext("2d");x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,W,H);
   const padB=20,padT=14,n=buckets.length;if(!n){x.fillStyle=C.dim;x.fillText("no completed requests",10,30);return;}
   const maxN=Math.max(1,...buckets.map(b=>b.n));
   const bw=(W-16)/n,barW=bw*0.56,base=H-padB,chartH=base-padT;
   x.strokeStyle=C.grid;x.lineWidth=1;x.beginPath();x.moveTo(6,base+.5);x.lineTo(W-6,base+.5);x.stroke();
   x.font="10px ui-monospace, monospace";x.textAlign="center";
+  const pts=[];
   buckets.forEach((b,i)=>{
     const cx=8+i*bw+bw/2, bh=chartH*(b.n/maxN), top=base-bh;
-    x.fillStyle=b.n?hexA(C.dec,.30):"rgba(150,160,190,.05)";
+    const bc=CTXC[i]||C.dec;
+    x.fillStyle=b.n?hexA(bc,.32):"rgba(150,160,190,.05)";
     x.fillRect(cx-barW/2, top, barW, bh);
-    x.fillStyle=b.n?C.dec:"rgba(150,160,190,.16)";
+    x.fillStyle=b.n?bc:"rgba(150,160,190,.16)";
     x.fillRect(cx-barW/2, top, barW, 2);
     x.fillStyle=b.n?C.muted:C.dim;
     x.fillText(String(b.n), cx, top-5);
     x.fillStyle=C.dim;
     x.fillText(b.label, cx, H-7);
+    pts.push({x:cx,html:`<b>${b.label}</b><br>requests ${b.n}`+
+      (b.avg_ttft_ms!=null?`<br>ttft ${ms(b.avg_ttft_ms)}`:"")+
+      (b.avg_decode!=null?`<br>${b.avg_decode.toFixed(0)} t/s`:"")});
   });
+  c._pts=pts;bindTip(c,"x");
   x.textAlign="left";
 }
 function drawScatter(pts){
   const c=$("scatter_chart");const dpr=window.devicePixelRatio||1;
-  const W=c.clientWidth,H=170;c.width=W*dpr;c.height=H*dpr;
+  const W=c.clientWidth,H=Math.max(c.clientHeight||170,170);c.width=W*dpr;c.height=H*dpr;
   const x=c.getContext("2d");x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,W,H);
   const padL=34,padR=10,padT=10,padB=20;
   const cw=W-padL-padR,ch=H-padT-padB;
@@ -1183,10 +1368,13 @@ function drawScatter(pts){
     x.beginPath();x.arc(X(p.x),Y(p.y),3.2,0,7);
     x.fillStyle=hexA(col,.72);x.fill();
   });
+  c._pts=pts.map(p=>({x:X(p.x),y:Y(p.y),html:`<b>${Math.round(p.x)} ctx</b><br>decode ${fmt(p.y)} t/s<br>ttft ${ms(p.ttft)}`}));
+  bindTip(c,"dist");
 }
 
 function render(s){
   const c=s.container,l=s.live,tp=s.tp,R=s.requests;
+  LAST=s;
   $("dot").className="dot "+(c.running?"up":"err");
   $("chip").innerHTML="<b>"+(c.name||"no container")+"</b>&nbsp;·&nbsp;"+(c.framework||"?")
     + "&nbsp;·&nbsp;"+(c.running?(c.state||"up"):(c.state||"exited"));
@@ -1200,18 +1388,31 @@ function render(s){
   $("meta").textContent="updated "+Math.max(0,Math.round(s.server.now-s.server.last_poll))+"s ago · auto 2s";
 
   const wlabel={60:"1m",300:"5m",900:"15m",3600:"1h"}[win]||win+"s";
-  $("c_dec").textContent=fmt(l.decode_tps);
-  $("c_dec_avg").textContent=fmt(tp.avg_decode);$("u_dec_avg").textContent=wlabel+" · "+(tp.samples||0)+" samples";
+  $("c_dec").textContent=l.idle?"idle":fmt(l.decode_tps);
+  $("c_dec_avg").textContent=fmt(tp.avg_decode);$("u_dec_avg").textContent=wlabel+" · active · "+(tp.samples||0)+" samples";
   $("c_dec_peak").textContent=fmt(tp.peak_decode);$("u_dec_peak").textContent=wlabel;
-  $("c_pre").textContent=fmt(l.prefill_tps);
-  $("c_pre_avg").textContent=fmt(tp.avg_prefill);$("u_pre_avg").textContent=wlabel;
+  $("c_pre").textContent=l.idle?"idle":fmt(l.prefill_tps);
+  $("c_pre_avg").textContent=fmt(tp.avg_prefill);$("u_pre_avg").textContent=wlabel+" · active";
   $("c_pre_peak").textContent=fmt(tp.peak_prefill);$("u_pre_peak").textContent=wlabel;
   $("c_run").textContent=(l.running==null?"-":l.running)+" / "+(l.waiting==null?"-":l.waiting);
   $("u_run").textContent="prefilling "+(l.prefilling==null?"-":l.prefilling);
   $("c_active").textContent=tp.active_pct==null?"-":fmt(tp.active_pct,1)+"%";
   $("chart_note").textContent="last "+wlabel+" · peak "+s.peak+" tok/s";
 
+  const th=s.thermal||{},tn=th.now||{};
+  if(tn.gpu_c!=null||tn.cpu_c!=null){
+    $("therm_txt").textContent=(tn.gpu_c!=null?"GPU "+Math.round(tn.gpu_c)+"°":"-")
+      +(tn.cpu_c!=null?" · CPU "+Math.round(tn.cpu_c)+"°":"")
+      +(tn.gpu_w!=null?" · "+Math.round(tn.gpu_w)+"W":"");
+    const hot=(tn.gpu_c!=null&&tn.gpu_c>=88)||(tn.cpu_c!=null&&tn.cpu_c>=95);
+    const warn=(tn.gpu_c!=null&&tn.gpu_c>=78)||(tn.cpu_c!=null&&tn.cpu_c>=85);
+    $("therm").className="therm"+(hot?" hot":warn?" warn":"");
+  }
+  $("therm_note").textContent="last "+wlabel+" · GPU max "+(th.max_gpu==null?"-":Math.round(th.max_gpu)+"°")+" · CPU max "+(th.max_cpu==null?"-":Math.round(th.max_cpu)+"°");
+  $("therm_fan").textContent=tn.fan_pct!=null?"GPU fan "+tn.fan_pct+"%":"";
+
   drawChart(s.series,s.peak,win,s.server.now);
+  if(activeTab==="therm")drawTherm(th.series,win,s.server.now);
   drawSpark("spark_dec",s.series.map(p=>p[1]).slice(-36),C.dec);
   drawSpark("spark_pre",s.series.map(p=>p[2]).slice(-36),C.pre);
 
@@ -1261,8 +1462,8 @@ function render(s){
   $("kv_pool").textContent=A.kv_total==null?"-":(A.kv_total/1000).toFixed(0)+"k tok";
   drawHistogram(A.ctx_hist||[]);
   drawScatter(A.scatter||[]);
-  $("hist_legend").innerHTML=(A.ctx_hist||[]).filter(b=>b.n).map(b=>
-    `<span>${b.label} · ${b.n}${b.avg_ttft_ms!=null?" · ttft "+ms(b.avg_ttft_ms):""}${b.avg_decode!=null?" · "+b.avg_decode.toFixed(0)+" t/s":""}</span>`).join("")
+  $("hist_legend").innerHTML=(A.ctx_hist||[]).map((b,idx)=>b.n?
+    `<span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${CTXC[idx]||C.dec};margin-right:5px;vertical-align:middle"></i>${b.label} · ${b.n}${b.avg_ttft_ms!=null?" · ttft "+ms(b.avg_ttft_ms):""}${b.avg_decode!=null?" · "+b.avg_decode.toFixed(0)+" t/s":""}</span>`:'').join("")
     ||'<span class="muted">no completed requests in window</span>';
 
   const G=s.gpu||{},gn=G.now||{};
@@ -1315,7 +1516,7 @@ function render(s){
 
   $("req_rows").innerHTML=(s.recent_requests&&s.recent_requests.length)?
     s.recent_requests.map(r=>`<tr><td>${tstr(r.t)}</td><td>${r.req}</td><td class="f-finish" style="color:${finishCol(r.finish)}">${esc(r.finish||"")}</td>
-    <td>${fmt0(r.prompt)}</td><td>${fmt0(r.gen)}</td><td>${ms(r.ttft_ms)}</td>
+    <td style="color:${ctxColor(r.prompt)};font-weight:600" title="${r.prompt!=null?CTXL[ctxBand(r.prompt)]:""}">${fmt0(r.prompt)}</td><td>${fmt0(r.gen)}</td><td>${ms(r.ttft_ms)}</td>
     <td>${fmt(r.decode)}</td><td>${r.wall==null?"-":fmt(r.wall,1)+"s"}</td><td>${mtpCell(r.mtp_pct)}</td></tr>`).join("")
     :`<tr><td colspan="9" style="text-align:left" class="muted">none in window</td></tr>`;
 
@@ -1338,7 +1539,47 @@ async function fetch_(){
     $("meta").textContent="unreachable: "+e;
   }
 }
-buildWins();fetch_();setInterval(fetch_,2000);
+const TABS=[["throughput","&#128200;","Throughput"],["therm","&#127777;","Thermal"],["streams","&#128256;","Streams"],["load","&#128202;","Load · KV · Ctx"],["req","&#128230;","Req · Queue"],["recent","&#128344;","Recent"],["log","&#128220;","Log"]];
+let activeTab=(()=>{const t=new URLSearchParams(location.search).get("tab");return TABS.some(x=>x[0]===t)?t:"throughput";})();
+function buildSidebar(){
+  const nav=$("sb_nav");nav.innerHTML="";
+  for(const [key,ico,label] of TABS){
+    const b=document.createElement("button");
+    b.className="tab"+(key===activeTab?" on":"");
+    b.dataset.tab=key;b.title=label;
+    b.innerHTML='<span class="tic">'+ico+'</span><span class="tablabel">'+label+'</span>';
+    b.onclick=()=>setTab(key);
+    nav.appendChild(b);
+  }
+}
+function setTab(key){
+  activeTab=key;
+  document.querySelectorAll(".tabpane").forEach(p=>p.classList.toggle("active",p.dataset.tab===key));
+  document.querySelectorAll(".sb-nav .tab").forEach(b=>b.classList.toggle("on",b.dataset.tab===key));
+  drawTab(key);
+}
+function drawTab(key){
+  if(!LAST)return;const s=LAST;
+  if(key==="throughput")drawChart(s.series,s.peak,win,s.server.now);
+  else if(key==="therm")drawTherm((s.thermal||{}).series,win,s.server.now);
+  else if(key==="streams")drawConc(s.conc_series,win,s.server.now);
+  else if(key==="load"){
+    const A=s.analysis||{};drawHistogram(A.ctx_hist||[]);drawScatter(A.scatter||[]);
+    const gser=((s.gpu||{}).series||[]).map(p=>p[1]).filter(v=>v!=null);
+    if(gser.length)drawSpark100("gpu_spark",gser.slice(-120),C.dec);
+  }
+}
+function initSidebar(){
+  const t=$("sb_toggle"),sb=$("sidebar");
+  const apply=()=>{sb.classList.toggle("collapsed",t.dataset.c==="1");t.innerHTML=t.dataset.c==="1"?"&#9654;":"&#9664;";};
+  t.onclick=()=>{t.dataset.c=t.dataset.c==="1"?"0":"1";localStorage.setItem("sb_c",t.dataset.c);apply();};
+  const saved=localStorage.getItem("sb_c");
+  t.dataset.c=saved!=null?saved:(window.innerWidth<760?"1":"0");
+  apply();
+  buildSidebar();
+  setTab(activeTab);
+}
+buildWins();initSidebar();fetch_();setInterval(fetch_,2000);
 </script>
 </body>
 </html>
