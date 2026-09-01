@@ -12,31 +12,53 @@ IMAGE=ninfer:latest
 MODEL_DIR=$HOME/models/ninfer/Qwen3.8-27B-nvfp4-NInfer
 MODEL_FILE=/models/qwen3_8_27b_nvfp4.ninfer
 PORT=8020
+# The stdout log drops the exception text of an engine failure (append_failure_fields
+# in serve/operational_log.cpp never emits machine_message), so a wedge is otherwise
+# unattributable. The JSONL sink is the only place it survives.
+JSONL_DIR="${JSONL_DIR:-$HOME/ninfer-logs}"
 API_KEY="${API_KEY:-}"
 API_ARGS=()
 if [ -n "$API_KEY" ]; then API_ARGS+=(--api-key "$API_KEY"); fi
 MODEL_ID=local
-KV_DTYPE="${KV_DTYPE:-fp8}"   # fp8 (E4M3 row-scaled, max capacity) | int8 (group-64, more accurate)
-HOST_KV_MIB="${HOST_KV_MIB:-24576}"   # pinned-CPU KV arena for long-conv spill; 24 GiB = 2 x text-mode (251K) long convs
+# nvfp4 (4-bit group-16) | k8v4 (K fp8 + V nvfp4) | fp8 (E4M3 row-256) | int8 (group-64) | bf16
+# Bytes per token per head (K+V): nvfp4 288, k8v4 402, fp8 516, int8 528, bf16 1024.
+# nvfp4 is the default for pool capacity, not speed: decode is only ~5% faster
+# and prefill ~7% slower than fp8, but the 1.79x pool keeps a multi-session
+# working set resident, and an evicted session costs a full re-prefill (~45 s at
+# 150K) against ~1.5 s on a prefix-cache hit. See profiles/README.md for the A/B.
+KV_DTYPE="${KV_DTYPE:-nvfp4}"
+HOST_KV_MIB="${HOST_KV_MIB:-24576}"   # pinned-CPU KV arena for long-conv spill; 24 GiB holds ~500K tokens of fp8 KV, ~900K of nvfp4
 DEVICE_STATE_SLOTS="${DEVICE_STATE_SLOTS:-4}"   # device checkpoint slots (pinned; engine default is +C)
 HOST_STATE_SLOTS="${HOST_STATE_SLOTS:-8}"       # host checkpoint slots (engine default)
 
-# ---- Vision toggle (default ON) -----------------------------------------
-# Override per-run without editing:  VISION=0 ./ninfer.sh start
+# ---- (VISION, KV_DTYPE) -> MAX_CONTEXT -----------------------------------
+# Override per-run without editing. The login shell here is fish, which has no
+# `VAR=value cmd` prefix syntax, so use env:
+#   env VISION=0 bash ninfer.sh start
+#   env VISION=0 KV_DTYPE=fp8 bash ninfer.sh start
 #
-# On the 32GB RTX 5090 the KV pool is VRAM-capped, and --max-context must be
-# <= that pool (engine reserves full KV for one max-length request). Measured:
-#   VISION=1  --vision on   KV pool 188224  -> MAX_CONTEXT=188224 (tested; 200000 OOMs)
-#             images/video separately capped at 32768 merged tokens.
-#   VISION=0  text-only     KV pool 251392  -> MAX_CONTEXT=251392 (~245K)
-#             (vision buffers freed grows the pool; nvfp4 card tops at 262144 w/ MTP off)
-# Both modes keep MTP3 speculative decoding.
+# The device KV pool is VRAM-capped and depends on BOTH knobs, so --max-context
+# has to be chosen per pair and stay <= that pair's own pool (the engine reserves
+# a full max-length request's KV). Pools measured with --kv-capacity auto on a
+# 32GB RTX 5090, ninfer 21a0e85f, MTP3 on:
+#   vision on  + fp8     pool 229376  ->  MAX_CONTEXT=188224  (82%)
+#   vision on  + nvfp4   pool 410944  ->  MAX_CONTEXT=262144  (64%)
+#   vision off + fp8     pool 257920  ->  MAX_CONTEXT=251392  (97%)
+#   vision off + nvfp4   pool 462144  ->  MAX_CONTEXT=400000  (87%)
+# Pool tokens scale exactly with the KV byte width, so a new dtype's pool is
+# predictable to <0.01% -- but measure it before adding a row here anyway.
+# Vision on additionally caps images/video at 32768 merged tokens; turning it
+# off buys ~12% more pool (available-after-weights 10.82 -> 11.10 GiB), not the
+# whole media reservation. All pairs keep MTP3 speculative decoding.
 VISION="${VISION:-1}"
-if [ "$VISION" = 1 ]; then
-  VISION_FLAG=(--vision); MAX_CONTEXT=188224
-else
-  VISION_FLAG=();         MAX_CONTEXT=251392
-fi
+case "$VISION:$KV_DTYPE" in
+  1:fp8)   VISION_FLAG=(--vision); MAX_CONTEXT=188224 ;;
+  1:nvfp4) VISION_FLAG=(--vision); MAX_CONTEXT=262144 ;;
+  0:fp8)   VISION_FLAG=();         MAX_CONTEXT=251392 ;;
+  0:nvfp4) VISION_FLAG=();         MAX_CONTEXT=400000 ;;
+  *) echo "no measured KV pool for VISION=$VISION KV_DTYPE=$KV_DTYPE;" \
+          "read kv_capacity_tokens from a trial start and add a row" >&2; exit 1 ;;
+esac
 # Re-inject prior-turn reasoning into later prompts (keeps agent long-conversations
 # coherent across turns). No effect on the API response shape (reasoning is always
 # a separate reasoning_content field); 0 to disable.
@@ -64,8 +86,10 @@ start() {
     --runtime=nvidia --gpus all \
     -p ${PORT}:${PORT} \
     -v ${MODEL_DIR}:/models:ro,z \
+    -v ${JSONL_DIR}:/reqlog:z \
     "$IMAGE" ninfer-serve "$MODEL_FILE" \
     --host 0.0.0.0 --port ${PORT} --cors \
+    --request-log-jsonl /reqlog/requests.jsonl \
     "${API_ARGS[@]}" --model-id ${MODEL_ID} \
     --max-context ${MAX_CONTEXT} --kv-capacity auto --kv-dtype ${KV_DTYPE} \
     --max-concurrency 4 --pending-timeout-ms 90000 --host-kv-mib ${HOST_KV_MIB} \

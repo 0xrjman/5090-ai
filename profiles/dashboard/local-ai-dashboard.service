@@ -1,0 +1,16 @@
+[Unit]
+Description=Local AI serving dashboard (ninfer/vllm monitor, :8021)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rjman
+WorkingDirectory=/home/rjman/Servers/local-ai/profiles/dashboard
+ExecStart=/usr/bin/env python3 /home/rjman/Servers/local-ai/profiles/dashboard/dashboard.py --port 8021 --bind 0.0.0.0
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

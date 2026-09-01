@@ -34,9 +34,10 @@ SERVED = [("vllm-qwen38", "vllm"), ("sglang-qwen38", "sglang"), ("ninfer-qwen38-
 SERVED_NAMES = {n for n, _ in SERVED}
 SERVED_FW = dict(SERVED)
 SERVE_API_PORT = 8020   # OpenAI endpoint all profiles expose
-# ninfer resolved device KV pool (3502 pages x 64 tok/page). Used as the denominator
-# for the estimated KV-occupancy gauge; bump if the engine's KV config changes.
-KV_TOTAL_TOKENS = 224128
+# Fallback device KV pool (tokens) for the estimated KV-occupancy gauge, used only
+# when the engine's boot log can't be read; the live value is captured per container
+# boot from `kv_capacity_tokens=` into st.kv_total (see kv_capacity_tokens()).
+KV_TOTAL_TOKENS = 410944      # = 6421 pages x 64 tok/page (nvfp4 default)
 
 MAX_TP = 6000           # ~5h of 5s throughput samples
 MAX_REQ = 2000
@@ -48,8 +49,9 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "metr
 TS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)\]")
 VLLM_TS_RE = re.compile(r"\b(\d{2})-(\d{2}) (\d{2}:\d{2}:\d{2})\b")
 KV_RE = re.compile(r"([a-zA-Z_]+)=([^\s]+)")
-REQ_RE = re.compile(r"\[req (\d+)\]")
+REQ_RE = re.compile(r"request id=(\d+)")
 MTP_RE = re.compile(r"(\d+(?:\.\d+)?)tok/round \((\d+(?:\.\d+)?)%\)")
+KV_CAP_RE = re.compile(r"kv_capacity_tokens=(\d+)")
 
 
 def _num(s):
@@ -106,41 +108,49 @@ def _line_ts(line):
 def parse_ninfer(line):
     """Return an event dict for a metric-bearing NInfer line, else None."""
     t = _line_ts(line)
-    if "ninfer-serve: throughput" in line and "interval=" in line:
+    if "[ninfer-serve] throughput" in line and "interval_ms=" in line:
         kv = _kv(line)
         return {"kind": "tp", "t": t,
-                "prefill": _f(kv.get("prefill")), "decode": _f(kv.get("decode")),
+                "prefill": _f(kv.get("prefill_tokens_per_second")),
+                "decode": _f(kv.get("decode_tokens_per_second")),
                 "running": _i(kv.get("running")), "prefilling": _i(kv.get("prefilling")),
                 "decode_ready": _i(kv.get("decode_ready")), "waiting": _i(kv.get("waiting")),
-                "avg_decode_batch": _f(kv.get("avg_decode_batch"))}
+                "avg_decode_batch": _f(kv.get("average_decode_batch"))}
     req = REQ_RE.search(line)
     if req:
         rid = req.group(1)
-        if "] done" in line:
+        if "status=done" in line:
             kv = _kv(line)
             m = MTP_RE.search(line)
+            _dur = _f(kv.get("duration_ms"))
             return {"kind": "done", "t": t, "req": rid,
-                    "finish": kv.get("finish"), "tool_calls": _i(kv.get("tool_calls")),
-                    "prompt": _i(kv.get("prompt")), "gen": _i(kv.get("gen")),
-                    "cache": _i(kv.get("cache")), "reuse": kv.get("reuse"),
-                    "ttft_ms": _f(kv.get("ttft")), "prefill": _f(kv.get("prefill")),
-                    "decode": _f(kv.get("decode")), "wall": _f(kv.get("wall")),
+                    "finish": kv.get("finish_reason"), "tool_calls": _i(kv.get("tool_calls")),
+                    "prompt": _i(kv.get("prompt_tokens")), "gen": _i(kv.get("completion_tokens")),
+                    "cache": _i(kv.get("prefix_cache_hit_tokens")),
+                    "reuse": kv.get("prefix_reuse_path"),
+                    "ttft_ms": _f(kv.get("ttft_ms")),
+                    "prefill": _f(kv.get("prefill_tokens_per_second")),
+                    "decode": _f(kv.get("decode_tokens_per_second")),
+                    "wall": (_dur / 1000.0) if _dur is not None else None,
                     "mtp_round": float(m.group(1)) if m else None,
                     "mtp_pct": float(m.group(2)) if m else None}
-        if "] error" in line:
-            return {"kind": "err", "t": t, "req": rid, "msg": line.split("error", 1)[1].strip()}
-        if "] rejected" in line:
+        if "status=error" in line:
+            msg = line.split("message=", 1)[1].strip() if "message=" in line else ""
+            return {"kind": "err", "t": t, "req": rid, "msg": msg}
+        if "status=rejected" in line:
             kv = _kv(line)
             msg = line.split("message=", 1)[1].strip() if "message=" in line else ""
             return {"kind": "rej", "t": t, "req": rid, "status": _i(kv.get("status")),
                     "code": kv.get("code"), "msg": msg}
-        if "submitted" in line:
+        if "status=submitted" in line:
             kv = _kv(line)
             proto = ("anthropic" if "anthropic_messages" in line
                      else "openai" if "openai_chat_completions" in line else "?")
             return {"kind": "sub", "t": t, "req": rid, "proto": proto,
-                    "stream": "non-stream" not in line,
-                    "msgs": _i(kv.get("msgs")), "max_tokens": _i(kv.get("max_tokens"))}
+                    "stream": kv.get("stream") == "true",
+                    "msgs": _i(kv.get("messages")), "max_tokens": _i(kv.get("requested_output_tokens"))}
+        if "status=cancelled" in line:
+            return {"kind": "cancel", "t": t, "req": rid}
     return None
 
 
@@ -191,7 +201,7 @@ def docker(*args):
 
 def gpu_stat():
     """Real GPU utilization/memory/power via nvidia-smi (single-GPU box). Returns a
-    dict or None if nvidia-smi is unavailable. ~20ms, called every 2nd poll."""
+    dict or None if nvidia-smi is unavailable. ~20ms, called every poll."""
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,power.draw,power.limit,temperature.gpu,fan.speed",
@@ -229,6 +239,11 @@ def pull_lines(st, name, tail):
         st.raw.append(ln)
         fresh.append(ln)
     return fresh
+
+
+def kv_capacity_tokens(name):
+    m = KV_CAP_RE.findall(docker("logs", name))
+    return int(m[-1]) if m else None
 
 
 def restamp(evs, now):
@@ -288,6 +303,8 @@ class Store:
         self.therm = deque(maxlen=2400)   # (ts, gpu_c, cpu_c, gpu_w, fan_pct) ~1h at 1.5s
         self.therm_db_ts = 0.0
         self.therm_prune_ts = 0.0
+        self.kv_total = None      # live KV pool (tokens) from the engine's boot log
+        self.kv_started = None    # container StartedAt that kv_total was captured for
         self.boot = time.time()
         self.lock = threading.Lock()
 
@@ -302,6 +319,8 @@ class Store:
         self._seen.clear()
         self._seen_q.clear()
         self.last_line_ts = 0
+        self.kv_total = None
+        self.kv_started = None
         self.target = name
         self.framework = SERVED_FW.get(name, name)
 
@@ -337,6 +356,9 @@ class Store:
         elif k == "rej":
             self.err.append({"t": ev["t"], "req": rid,
                              "msg": f"{ev.get('status', '?')} {ev.get('code', '?')}: {ev.get('msg', '')}"})
+            if rid is not None:
+                self.inflight.pop(rid, None)
+        elif k == "cancel":
             if rid is not None:
                 self.inflight.pop(rid, None)
         if ev.get("t"):
@@ -413,6 +435,9 @@ def record(conn, container, framework, evs):
             pass
 
 
+RETENTION = 86400  # seconds of throughput/requests history to keep
+
+
 def poll_loop(st, tail, conn):
     while True:
         d = discover()
@@ -433,6 +458,10 @@ def poll_loop(st, tail, conn):
                 st.state_str = status
                 st.image = image
                 if running:
+                    started = docker("inspect", "--format", "{{.State.StartedAt}}", name).strip()
+                    if started and started != st.kv_started:
+                        st.kv_total = kv_capacity_tokens(name)
+                        st.kv_started = started
                     fresh = pull_lines(st, name, tail)
                     parser = PARSERS.get(st.framework)
                     if parser is not None and fresh:
@@ -466,7 +495,10 @@ def poll_loop(st, tail, conn):
                 pass
         if prune_therm is not None:
             try:
+                cutoff = now - RETENTION
                 conn.execute("DELETE FROM thermal WHERE ts < ?", (prune_therm,))
+                conn.execute("DELETE FROM throughput WHERE ts < ?", (cutoff,))
+                conn.execute("DELETE FROM requests WHERE ts < ?", (cutoff,))
                 conn.commit()
             except sqlite3.Error:
                 pass
@@ -601,7 +633,8 @@ def build_state(st, window):
 
         recent_req = [{"t": r["t"], "req": r["req"], "finish": r["finish"],
                        "prompt": r["prompt"], "gen": r["gen"], "ttft_ms": r["ttft_ms"],
-                       "decode": r["decode"], "wall": r["wall"], "mtp_pct": r["mtp_pct"]}
+                       "decode": r["decode"], "wall": r["wall"], "mtp_pct": r["mtp_pct"],
+                       "cache": r.get("cache"), "reuse": r.get("reuse")}
                       for r in list(st.req)[-30:]][::-1]
         recent_err = [{"t": e["t"], "req": e["req"], "msg": e["msg"]}
                       for e in list(st.err)[-20:]][::-1]
@@ -643,19 +676,20 @@ def build_state(st, window):
         scatter = [{"x": r["prompt"], "y": r["decode"], "ttft": r["ttft_ms"]}
                    for r in done if r["prompt"] is not None and r["decode"] is not None][-80:]
         _ap = ap or 0
+        kv_total = st.kv_total or KV_TOTAL_TOKENS
         kv_series = _downsample_series(
             [(s["t"], (s.get("running") or 0) + (s.get("prefilling") or 0),
               round(((s.get("running") or 0) + (s.get("prefilling") or 0)) * _ap),
               round(min(100.0, 100.0 * ((s.get("running") or 0) + (s.get("prefilling") or 0)) * _ap
-                        / KV_TOTAL_TOKENS), 1) if _ap else None)
+                        / kv_total), 1) if _ap else None)
              for s in tp_win])
         if latest and _ap:
             _inf = (latest.get("running") or 0) + (latest.get("prefilling") or 0)
             kv_now = {"in_flight": _inf, "tokens": round(_inf * _ap),
-                      "pct": round(min(100.0, 100.0 * _inf * _ap / KV_TOTAL_TOKENS), 1)}
+                      "pct": round(min(100.0, 100.0 * _inf * _ap / kv_total), 1)}
         else:
             kv_now = {"in_flight": None, "tokens": None, "pct": None}
-        analysis = {"kv_total": KV_TOTAL_TOKENS, "avg_prompt": ap,
+        analysis = {"kv_total": kv_total, "avg_prompt": ap,
                     "ctx_hist": ctx_hist, "scatter": scatter,
                     "kv_series": kv_series, "kv_now": kv_now}
 
@@ -928,6 +962,19 @@ canvas.conc{height:150px}
 .srow .age{font-family:var(--mono);font-size:20px;font-weight:700;text-align:right;line-height:1;font-variant-numeric:tabular-nums}
 .srow .bar{grid-column:1/-1;height:6px;background:#070810;border-radius:4px;overflow:hidden}
 .srow .bar i{display:block;height:100%;border-radius:4px;transition:width .45s ease}
+.sgrp{background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:12px;padding:9px 12px;transition:border-color .15s}
+.sgrp:hover{border-color:var(--border-2)}
+.ghead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:7px}
+.ghead b{color:var(--txt);font-weight:650;font-size:12.5px}
+.gcnt{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--txt);background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:20px;padding:0 8px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.reqchip{font-family:var(--mono);font-size:11px;font-variant-numeric:tabular-nums;background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:6px;padding:2px 7px}
+.reqchip.stale{opacity:.5;text-decoration:line-through}
+.reqchip .rid{opacity:.6}
+.reqchip .rage{margin-left:6px;padding-left:6px;border-left:1px solid var(--border);font-weight:600}
+.cbadge{font-family:var(--mono);font-size:10.5px;font-weight:600;border-radius:6px;padding:1px 7px;white-space:nowrap}
+.cbadge.warm{color:var(--ok);background:rgba(55,211,159,.1);border:1px solid rgba(55,211,159,.3)}
+.cbadge.cold{color:var(--muted);background:rgba(255,255,255,.03);border:1px solid var(--border)}
 .p0{background:var(--run)}.p1{background:var(--pre)}.p2{background:var(--err)}
 .sdone{display:flex;flex-direction:column;gap:6px;margin-top:2px}
 .sdone .d{display:grid;grid-template-columns:auto 1fr auto;gap:2px 12px;align-items:baseline;
@@ -1417,32 +1464,51 @@ function render(s){
   drawSpark("spark_pre",s.series.map(p=>p[2]).slice(-36),C.pre);
 
   const streams=s.streams||[];
-  const maxAge=streams.length?Math.max(1,streams[0].age_s||0):1;
   $("stream_note").textContent=streams.length
     ?(streams.length+" active · heaviest "+(streams[0].age_s!=null?streams[0].age_s.toFixed(1)+"s":"-"))
     :(c.per_request?"none in flight":"not reported by "+c.framework);
-  $("streams").innerHTML=streams.length?streams.map(sr=>{
-    const a=sr.age_s;
-    const col=a==null?"var(--dim)":(a<30?C.run:a<120?C.pre:C.err);
-    const cls=a==null?"p0":(a<30?"p0":a<120?"p1":"p2");
-    const w=a==null?0:Math.max(2,Math.min(100,(a/maxAge)*100));
-    return `<div class="srow">
-      <div><span class="id">${esc(sr.req)}</span>
-        <span class="tag">${esc(sr.proto||"?")}</span>
-        <span class="tag">${sr.stream?"stream":"oneshot"}</span></div>
-      <div class="age" style="color:${col}">${a==null?"-":a.toFixed(1)+"s"}</div>
-      <div class="meta">${sr.msgs!=null?sr.msgs+" msgs":"?"} · max ${sr.max_tokens==null?"?":sr.max_tokens} tok</div>
-      <div></div>
-      <div class="bar"><i class="${cls}" style="width:${w}%"></i></div>
-    </div>`;
-  }).join(""):(c.per_request?'<div class="empty">no active streams — waiting for requests…</div>'
-    :'<div class="empty">'+c.framework+' does not log per-request streams — live concurrency is in the "Requests" card and the concurrency-over-time chart…</div>');
+  let streamsHTML;
+  if(streams.length){
+    const groups=new Map();
+    for(const sr of streams){
+      const k=(sr.proto||"?")+"|"+(sr.max_tokens==null?"?":sr.max_tokens);
+      if(!groups.has(k))groups.set(k,{proto:sr.proto||"?",max_tokens:sr.max_tokens,items:[]});
+      groups.get(k).items.push(sr);
+    }
+    const glist=[...groups.values()].sort((A,B)=>
+      B.items.reduce((x,s)=>x+(s.age_s||0),0)-A.items.reduce((x,s)=>x+(s.age_s||0),0));
+    streamsHTML=glist.map(g=>{
+      const n=g.items.length;
+      const sumMsgs=g.items.reduce((x,s)=>x+(s.msgs||0),0);
+      const oldest=Math.max(0,...g.items.map(s=>s.age_s||0));
+      const lim=g.max_tokens==null?"?":(g.max_tokens>=1000?(+(g.max_tokens/1000).toFixed(1))+"k":g.max_tokens)+" tok";
+      const chips=g.items.map(sr=>{
+        const a=sr.age_s;
+        const col=a==null?C.dim:(a<30?C.run:a<120?C.pre:C.err);
+        const stale=a!=null&&a>300;
+        return `<span class="reqchip${stale?" stale":""}" style="color:${col}"><span class="rid">#${esc(sr.req)}</span>${a!=null?`<span class="rage">${a.toFixed(0)}s</span>`:""}</span>`;
+      }).join("");
+      return `<div class="sgrp">
+        <div class="ghead"><b>${esc(g.proto)}</b><span class="gcnt">${n}</span>
+          <span class="meta">${lim} max · Σ ${sumMsgs} msgs · oldest ${oldest.toFixed(0)}s</span></div>
+        <div class="chips">${chips}</div>
+      </div>`;
+    }).join("");
+  }else{
+    streamsHTML=c.per_request
+      ?'<div class="empty">no active streams — waiting for requests…</div>'
+      :'<div class="empty">'+c.framework+' does not log per-request streams — live concurrency is in the "Requests" card and the concurrency-over-time chart…</div>';
+  }
+  $("streams").innerHTML=streamsHTML;
+  const cbadge=r=>{const h=r.cache,u=r.reuse;
+    return h>0?`<span class="cbadge warm" title="${esc(u||"cache hit")}">⚡ +${h>=1000?(+(h/1000).toFixed(1))+"k":h} cached</span>`
+              :`<span class="cbadge cold" title="${esc(u||"root")}">○ cold</span>`;};
   const sd=(s.recent_requests||[]).slice(0,8);
   $("streams_done").innerHTML=sd.length?sd.map(r=>{
     const w=r.wall;const wcol=w==null?C.dim:w<30?C.run:w<120?C.pre:C.err;
     const ctx=r.prompt==null?"?":(r.prompt>=1000?(+(r.prompt/1000).toFixed(1))+"k":r.prompt);
     return `<div class="d"><span class="rid">#${r.req}</span>
-      <span class="m">${ctx} ctx · ${r.gen==null?"?":fmt0(r.gen)} gen · ttft ${ms(r.ttft_ms)} · mtp ${mtpCell(r.mtp_pct)}</span>
+      <span class="m">${ctx} ctx · ${r.gen==null?"?":fmt0(r.gen)} gen · ttft ${ms(r.ttft_ms)} · mtp ${mtpCell(r.mtp_pct)} ${cbadge(r)}</span>
       <span class="wall" style="color:${wcol}">${w==null?"-":fmt(w,1)+"s"}</span></div>`;
   }).join(""):'<div class="empty">no completed requests yet</div>';
   drawConc(s.conc_series,win,s.server.now);
