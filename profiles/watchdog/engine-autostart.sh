@@ -11,14 +11,14 @@
 # Missing/unrecognized state falls back to vllm, matching the old hardcoded
 # behavior.
 #
-# cron: * * * * * /home/rjman/Servers/local-ai/profiles/watchdog/engine-autostart.sh
+# cron: * * * * * $HOME/Servers/local-ai/profiles/watchdog/engine-autostart.sh
 set -euo pipefail
 
 PROFILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAST_ENGINE_FILE="$PROFILES_DIR/watchdog/.last-engine"
 
-LOG=/home/rjman/engine-autostart.log
-STATE=/home/rjman/.engine-autostart.idle
+LOG=$HOME/engine-autostart.log
+STATE=$HOME/.engine-autostart.idle
 IDLE_MIB=500
 IDLE_NEEDED=5
 

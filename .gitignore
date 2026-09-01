@@ -12,4 +12,7 @@ profiles/watchdog/.idle-state
 __pycache__/
 *.pyc
 
+# ad-hoc scratch exports
+csv
+
 # weights and JIT caches live under _archive/ and are ignored by _archive/.gitignore

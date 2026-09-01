@@ -75,7 +75,7 @@ profiles/dashboard/dashboard.sh [start|stop|status|logs]
   `--restart=always`. Same root cause category as the vLLM failure above: the
   draft checkpoint's `config.json` declares `architectures:
   ["DFlash2DraftModel"]` with no `auto_map` and no `modeling_*.py` in the repo
-  (`/home/rjman/models/qwen3.8-27b-dflash2` only has `config.json` +
+  (`$HOME/models/qwen3.8-27b-dflash2` only has `config.json` +
   `model.safetensors`), so it relies entirely on the inference engine having
   that exact class built into its model registry — and this sglang build
   doesn't, despite accepting the `--speculative-algorithm DFLASH` flag itself.
@@ -94,5 +94,5 @@ profiles/dashboard/dashboard.sh [start|stop|status|logs]
   is left switchable only in case a future sglang image registers this
   architecture — don't flip the default back without re-testing on the actual
   image. Weights live at
-  `/home/rjman/data/models/qwen3.8-27b-dflash2` (real files) with
-  `/home/rjman/models/qwen3.8-27b-dflash2` symlinked to the same dir.
+  `$HOME/data/models/qwen3.8-27b-dflash2` (real files) with
+  `$HOME/models/qwen3.8-27b-dflash2` symlinked to the same dir.
