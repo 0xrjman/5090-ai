@@ -19,7 +19,9 @@ running_pid() {
   local p=""
   [ -f "$PIDFILE" ] && p="$(cat "$PIDFILE" 2>/dev/null || true)"
   if alive "$p"; then echo "$p"; return; fi
-  p="$(ss -ltnp 2>/dev/null | awk -v pt=":$PORT" '$4==pt{match($0,/pid=[0-9]+/);print substr($0,RSTART+4,RLENGTH-4)}' | head -1 || true)"
+  # match the port suffix: the listen address is "0.0.0.0:8021" under --bind 0.0.0.0,
+  # never a bare ":8021", so an equality test never finds the running dashboard
+  p="$(ss -ltnp 2>/dev/null | awk -v pt=":$PORT" '$4 ~ pt"$"{match($0,/pid=[0-9]+/);print substr($0,RSTART+4,RLENGTH-4)}' | head -1 || true)"
   alive "$p" && echo "$p"
   return 0
 }

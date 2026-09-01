@@ -30,6 +30,12 @@ KV_DTYPE="${KV_DTYPE:-nvfp4}"
 HOST_KV_MIB="${HOST_KV_MIB:-24576}"   # pinned-CPU KV arena for long-conv spill; 24 GiB holds ~500K tokens of fp8 KV, ~900K of nvfp4
 DEVICE_STATE_SLOTS="${DEVICE_STATE_SLOTS:-4}"   # device checkpoint slots (pinned; engine default is +C)
 HOST_STATE_SLOTS="${HOST_STATE_SLOTS:-8}"       # host checkpoint slots (engine default)
+# Shared-prefix publication is the second checkpoint reference on a continuation's
+# StateImage, which makes state_exclusive_to_sequence false and trips the wedge
+# ("materialization source has no resident state", program_impl.h:4772). 0 keeps
+# private_response_replay (66% of live requests) and gives up shared_stable_prefix
+# (12%). Set back to 4 only with a reproducer run to confirm the wedge is gone.
+MAX_SHARED_PREFIXES="${MAX_SHARED_PREFIXES:-0}"
 
 # ---- (VISION, KV_DTYPE) -> MAX_CONTEXT -----------------------------------
 # Override per-run without editing. The login shell here is fish, which has no
@@ -99,6 +105,7 @@ start() {
     --max-context ${MAX_CONTEXT} --kv-capacity auto --kv-dtype ${KV_DTYPE} \
     --max-concurrency 4 --pending-timeout-ms 90000 --host-kv-mib ${HOST_KV_MIB} \
     --device-state-slots ${DEVICE_STATE_SLOTS} --host-state-slots ${HOST_STATE_SLOTS} \
+    --max-shared-prefixes ${MAX_SHARED_PREFIXES} \
     "${VISION_FLAG[@]}" \
     "${PRESERVE_FLAG[@]}" \
     --spec mtp --draft-tokens 3 --lm-head-draft
