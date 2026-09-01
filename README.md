@@ -64,8 +64,6 @@ If the endpoint 400s on `thinking: adaptive`, add
 
 ## Notes (measured)
 
-- SGLang + DSpark speculative decoding on this 5090 deployment gave **no** decode
-  throughput gain (77 vs 78 tok/s, within noise) and shrank the KV pool, so DSpark
-  is off in both scenarios. Measured pure-decode throughput is ~77-78 tok/s
-  (2026-08-15, RadixArk Qwen3.8-27B-NVFP4). Re-check only after
-  sglang-project/sglang PR #34742 lands and the image is repulled.
+- Measured decode throughput (2026-09-01, ninfer with MTP speculative decoding on):
+  per-request up to ~221 tok/s (avg ~150); ~406 tok/s system-wide with 3 concurrent
+  streams. Supersedes the 2026-08-15 SGLang figure (~77-78 tok/s).
