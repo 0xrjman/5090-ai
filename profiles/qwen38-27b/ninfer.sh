@@ -53,7 +53,7 @@ start() {
     --host 0.0.0.0 --port ${PORT} --cors \
     --api-key ${API_KEY} --model-id ${MODEL_ID} \
     --max-context ${MAX_CONTEXT} --kv-capacity auto --kv-dtype int8 \
-    --max-concurrency 4 \
+    --max-concurrency 4 --pending-timeout-ms 90000 \
     "${VISION_FLAG[@]}" \
     --spec mtp --draft-tokens 3 --lm-head-draft
   echo "started, tail logs with: $0 logs"

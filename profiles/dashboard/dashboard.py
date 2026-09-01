@@ -189,6 +189,23 @@ def docker(*args):
         return ""
 
 
+def gpu_stat():
+    """Real GPU utilization/memory/power via nvidia-smi (single-GPU box). Returns a
+    dict or None if nvidia-smi is unavailable. ~20ms, called every 2nd poll."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,power.draw,power.limit",
+             "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE, text=True, timeout=3).stdout.strip()
+        if not out:
+            return None
+        u, mu, mt, pw, pl = (x.strip() for x in out.split(",")[:5])
+        return {"util": _i(u), "mem_used": _i(mu), "mem_total": _i(mt),
+                "power_w": _f(pw), "power_limit_w": _f(pl), "ts": time.time()}
+    except Exception:
+        return None
+
+
 def pull_lines(st, name, tail):
     """Return this poll's fresh (not-yet-seen) log lines, appended to st.raw."""
     fresh = []
@@ -253,6 +270,8 @@ class Store:
         self.last_line_ts = 0
         self.last_poll = time.time()
         self.docker_ok = True
+        self.gpu = deque(maxlen=120)   # (ts, util_pct) recent samples for a trend sparkline
+        self.gpu_now = None            # latest full nvidia-smi snapshot
         self.boot = time.time()
         self.lock = threading.Lock()
 
@@ -405,6 +424,11 @@ def poll_loop(st, tail, conn):
                             for _, ev in evs:
                                 st.ingest(ev, now)
                             record(conn, name, st.framework, evs)
+        g = gpu_stat()
+        if g is not None:
+            with st.lock:
+                st.gpu_now = g
+                st.gpu.append((now, g["util"]))
         time.sleep(POLL)
 
 
@@ -607,6 +631,8 @@ def build_state(st, window):
         last_seen = st.last_line_ts
         docker_ok = st.docker_ok
         boot = st.boot
+        gpu_now = st.gpu_now
+        gpu_series = [[round(t, 3), u] for t, u in st.gpu][-160:]
 
     dec_vals = [p[1] for p in series]
     pre_vals = [p[2] for p in series]
@@ -620,6 +646,7 @@ def build_state(st, window):
                       "last_seen": round(last_seen, 3),
                       "has_parser": framework in PARSERS,
                       "per_request": framework in PER_REQUEST},
+        "gpu": {"now": gpu_now, "series": gpu_series},
         "window": window,
         "live": live,
         "tp": tp_metrics,
@@ -849,6 +876,9 @@ canvas.conc{height:150px}
 .sdone .d .wall{font-weight:700;font-variant-numeric:tabular-nums}
 .loadrow{display:grid;grid-template-columns:230px 1fr 1fr;gap:20px;align-items:start}
 @media(max-width:1000px){.loadrow{grid-template-columns:1fr}}
+.loadcol{display:flex;flex-direction:column;gap:16px}
+.loadcol .kvbox{flex:1}
+.spark{display:block;width:100%;height:30px;margin-top:9px}
 .kvbox{background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:12px;padding:14px 15px}
 .kvl{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);font-weight:600}
 .kvtag{margin-left:auto;font-size:9.5px;font-family:var(--mono);color:var(--dim);text-transform:uppercase;
@@ -927,13 +957,24 @@ footer code{background:rgba(255,255,255,.05);border:1px solid var(--border);padd
   <div class="panel">
     <div class="ph"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="10" width="3" height="7" rx="1"/><rect x="12" y="6" width="3" height="11" rx="1"/><rect x="17" y="13" width="3" height="4" rx="1"/></svg></span><h2>Load &middot; KV &middot; context</h2><span class="note" id="load_note"></span></div>
     <div class="loadrow">
-      <div class="kvbox">
-        <div class="kvl"><span>KV occupancy</span><span class="kvtag">estimate</span></div>
-        <div class="kvbig"><b id="kv_pct">-</b><span>/ 100%</span></div>
-        <div class="kvbar"><i id="kv_fill"></i></div>
-        <div class="kvmeta" id="kv_meta"></div>
-        <div class="kvmini"><span class="l">avg context</span><span class="n" id="kv_avgctx">-</span></div>
-        <div class="kvmini"><span class="l">KV pool</span><span class="n" id="kv_pool">-</span></div>
+      <div class="loadcol">
+        <div class="kvbox">
+          <div class="kvl"><span>KV occupancy</span><span class="kvtag">estimate</span></div>
+          <div class="kvbig"><b id="kv_pct">-</b><span>/ 100%</span></div>
+          <div class="kvbar"><i id="kv_fill"></i></div>
+          <div class="kvmeta" id="kv_meta"></div>
+          <div class="kvmini"><span class="l">avg context</span><span class="n" id="kv_avgctx">-</span></div>
+          <div class="kvmini"><span class="l">KV pool</span><span class="n" id="kv_pool">-</span></div>
+        </div>
+        <div class="kvbox">
+          <div class="kvl"><span>GPU power</span><span class="kvtag">nvidia-smi</span></div>
+          <div class="kvbig"><b id="gpu_power">-</b><span>W now</span></div>
+          <div class="kvbar"><i id="gpu_fill"></i></div>
+          <div class="kvmini"><span class="l">VRAM</span><span class="n" id="gpu_mem">-</span></div>
+          <div class="kvmini"><span class="l">util now</span><span class="n" id="gpu_util">-</span></div>
+          <div class="kvmini"><span class="l">util trend</span><span class="n dim" id="gpu_avg">-</span></div>
+          <canvas id="gpu_spark" class="spark"></canvas>
+        </div>
       </div>
       <div class="loadchart"><div class="subhead2">context length distribution</div><canvas id="hist_chart"></canvas><div class="hleg" id="hist_legend"></div></div>
       <div class="loadchart"><div class="subhead2">context &times; decode tok/s <span class="dim">(color = ttft)</span></div><canvas id="scatter_chart"></canvas></div>
@@ -1022,6 +1063,19 @@ function drawSpark(id,vals,color){
   const v=vals.filter(n=>n!=null);if(v.length<2)return;
   const mn=Math.min(...v),mx=Math.max(...v),rng=(mx-mn)||1;
   const P=vals.map((n,i)=>[i/(vals.length-1)*(W-2)+1,H-2-(((n==null?mn:n)-mn)/rng)*(H-4)]);
+  const g=x.createLinearGradient(0,0,0,H);g.addColorStop(0,hexA(color,.42));g.addColorStop(1,hexA(color,0));
+  x.beginPath();smoothPath(x,P);x.lineTo(P[P.length-1][0],H);x.lineTo(P[0][0],H);x.closePath();x.fillStyle=g;x.fill();
+  x.beginPath();smoothPath(x,P);x.strokeStyle=color;x.lineWidth=1.5;x.lineJoin='round';x.lineCap='round';x.stroke();
+}
+function drawSpark100(id,vals,color){
+  const c=$(id);if(!c||!c.clientWidth)return;
+  const dpr=window.devicePixelRatio||1;const W=c.clientWidth,H=c.clientHeight;
+  if(!W||!H)return;
+  if(c.width!==Math.round(W*dpr)){c.width=W*dpr;c.height=H*dpr;}
+  const x=c.getContext("2d");x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,W,H);
+  const v=vals.filter(n=>n!=null);if(v.length<2)return;
+  const P=vals.map((n,i)=>[i/(vals.length-1)*(W-2)+1,H-2-((n==null?0:n)/100)*(H-4)]);
+  x.strokeStyle=C.grid;x.beginPath();x.moveTo(0,H-2);x.lineTo(W,H-2);x.stroke();
   const g=x.createLinearGradient(0,0,0,H);g.addColorStop(0,hexA(color,.42));g.addColorStop(1,hexA(color,0));
   x.beginPath();smoothPath(x,P);x.lineTo(P[P.length-1][0],H);x.lineTo(P[0][0],H);x.closePath();x.fillStyle=g;x.fill();
   x.beginPath();smoothPath(x,P);x.strokeStyle=color;x.lineWidth=1.5;x.lineJoin='round';x.lineCap='round';x.stroke();
@@ -1210,6 +1264,24 @@ function render(s){
   $("hist_legend").innerHTML=(A.ctx_hist||[]).filter(b=>b.n).map(b=>
     `<span>${b.label} · ${b.n}${b.avg_ttft_ms!=null?" · ttft "+ms(b.avg_ttft_ms):""}${b.avg_decode!=null?" · "+b.avg_decode.toFixed(0)+" t/s":""}</span>`).join("")
     ||'<span class="muted">no completed requests in window</span>';
+
+  const G=s.gpu||{},gn=G.now||{};
+  if(gn.power_w!=null){
+    const lim=gn.power_limit_w||600, pp=Math.min(100,Math.max(0,gn.power_w/lim*100));
+    $("gpu_power").textContent=Math.round(gn.power_w);
+    $("gpu_fill").style.width=pp+"%";
+    $("gpu_util").textContent=gn.util!=null?Math.round(gn.util)+"%":"-";
+    $("gpu_mem").textContent=(gn.mem_used!=null&&gn.mem_total?(gn.mem_used/1024).toFixed(0)+"G / "+(gn.mem_total/1024).toFixed(0)+"G":"-");
+  }else{
+    $("gpu_power").textContent="-";$("gpu_fill").style.width="0%";$("gpu_util").textContent="-";$("gpu_mem").textContent="-";
+  }
+  const gser=(G.series||[]).map(p=>p[1]).filter(v=>v!=null);
+  if(gser.length){
+    $("gpu_avg").textContent="avg "+Math.round(gser.reduce((a,b)=>a+b,0)/gser.length)+"% · "+gser.length+"s";
+    drawSpark100("gpu_spark",gser.slice(-120),C.dec);
+  }else{
+    $("gpu_avg").textContent="-";$("gpu_spark")&&$("gpu_spark").getContext&&$("gpu_spark").getContext("2d").clearRect(0,0,500,500);
+  }
 
   $("req_note").textContent=wlabel;
   $("req_kv").innerHTML=kv([
