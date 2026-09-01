@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Qwen3.8-27B-NVFP4 - RadixArk build - SGLang
 # ckpt (HF): RadixArk (base: Qwen/Qwen3.8-27B) [confirm exact repo id on HF]
-# refetch:   hf download <RadixArk/Qwen3.8-27B-NVFP4> --local-dir /home/rjman/models/qwen3.8-27b-nvfp4-radixark
+# refetch:   hf download <RadixArk/Qwen3.8-27B-NVFP4> --local-dir $HOME/models/qwen3.8-27b-nvfp4-radixark
 #
 # draft (HF): z-lab/Qwen3.8-27B-DFlash2 (block-diffusion drafter, for SPEC_METHOD=dflash -- BROKEN, see profiles/README.md)
 # refetch:    HF_ENDPOINT=https://hf-mirror.com hf download z-lab/Qwen3.8-27B-DFlash2 \
-#               --local-dir /home/rjman/models/qwen3.8-27b-dflash2
+#               --local-dir $HOME/models/qwen3.8-27b-dflash2
 #
 # MTP (SPEC_METHOD=mtp): uses the in-checkpoint MTP head, no separate draft
 # download -- this is sglang's official recipe for this checkpoint per
@@ -16,13 +16,19 @@
 #   longctx concurrency=1  --max-mamba-cache-size 4  (single session, max context)
 # usage: sglang.sh [main|longctx] [start|stop|status|logs]   (default: main)
 set -euo pipefail
+# load repo-root .env (gitignored) — real API key etc.
+_sdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$_sdir/../../.env" ]; then set -a; . "$_sdir/../../.env"; set +a; fi
 NAME=sglang-qwen38
 IMG=lmsysorg/sglang:qwen38-27b
-MODEL=/home/rjman/models/qwen3.8-27b-nvfp4-radixark
+MODEL=$HOME/models/qwen3.8-27b-nvfp4-radixark
 PORT=8020
+API_KEY="${API_KEY:-}"
+API_ARGS=()
+if [ -n "$API_KEY" ]; then API_ARGS+=(--api-key "$API_KEY"); fi
 
 SPEC_METHOD="${SPEC_METHOD:-mtp}"   # mtp (default) | none | dflash (broken, see profiles/README.md)
-DFLASH_DIR="${DFLASH_DIR:-/home/rjman/models/qwen3.8-27b-dflash2}"
+DFLASH_DIR="${DFLASH_DIR:-$HOME/models/qwen3.8-27b-dflash2}"
 DFLASH_NUM_SPEC="${DFLASH_NUM_SPEC:-8}"
 
 if [ "$SPEC_METHOD" = "dflash" ] && [ ! -d "$DFLASH_DIR" ]; then
@@ -81,11 +87,11 @@ start() {
       --max-mamba-cache-size "$MAMBA_CACHE" \
       --reasoning-parser qwen3 \
       --tool-call-parser qwen3_coder \
-      --api-key rjman \
+      "${API_ARGS[@]}" \
       --served-model-name local \
       --host 0.0.0.0 --port 30000 \
       "${SPEC_ARGS[@]}"
-  echo "started: $NAME (port $PORT, api-key=rjman, model=local, $SCENARIO_NOTE, concurrency=$CONCURRENT, spec=$SPEC_METHOD)"
+  echo "started: $NAME (port $PORT, auth=$([ -n "$API_KEY" ] && echo on || echo off), model=local, $SCENARIO_NOTE, concurrency=$CONCURRENT, spec=$SPEC_METHOD)"
   _profiles_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   echo "sglang:$SCENARIO" > "$_profiles_dir/watchdog/.last-engine" 2>/dev/null || true
   _dash="$_profiles_dir/dashboard/dashboard.sh"

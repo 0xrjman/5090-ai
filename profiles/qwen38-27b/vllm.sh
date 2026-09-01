@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 # Qwen3.8-27B-NVFP4 - unsloth build - vLLM
 # ckpt (HF): unsloth/Qwen3.8-27B-NVFP4 (base: Qwen/Qwen3.8-27B)
-# refetch:   hf download unsloth/Qwen3.8-27B-NVFP4 --local-dir /home/rjman/data/models/qwen3.8-27b-nvfp4-unsloth
+# refetch:   hf download unsloth/Qwen3.8-27B-NVFP4 --local-dir $HOME/data/models/qwen3.8-27b-nvfp4-unsloth
 #
 # draft (HF): z-lab/Qwen3.8-27B-DFlash2 (block-diffusion drafter, for SPEC_METHOD=dflash)
 # refetch:    HF_ENDPOINT=https://hf-mirror.com hf download z-lab/Qwen3.8-27B-DFlash2 \
-#               --local-dir /home/rjman/data/models/qwen3.8-27b-dflash2
+#               --local-dir $HOME/data/models/qwen3.8-27b-dflash2
 set -euo pipefail
+# load repo-root .env (gitignored) — real API key etc.
+_sdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$_sdir/../../.env" ]; then set -a; . "$_sdir/../../.env"; set +a; fi
 NAME=vllm-qwen38
 IMG=vllm/vllm-openai:v0.27.1
-MODEL=/home/rjman/data/models/qwen3.8-27b-nvfp4-unsloth
+MODEL=$HOME/data/models/qwen3.8-27b-nvfp4-unsloth
 PORT=8020
+API_KEY="${API_KEY:-}"
+API_ARGS=()
+if [ -n "$API_KEY" ]; then API_ARGS+=(--api-key "$API_KEY"); fi
 
 SPEC_METHOD="${SPEC_METHOD:-mtp}"   # mtp (default) | dflash (BROKEN on vllm/vllm-openai:v0.27.1, see below)
-DFLASH_DIR="${DFLASH_DIR:-/home/rjman/data/models/qwen3.8-27b-dflash2}"
+DFLASH_DIR="${DFLASH_DIR:-$HOME/data/models/qwen3.8-27b-dflash2}"
 DFLASH_NUM_SPEC="${DFLASH_NUM_SPEC:-8}"
 
 # Measured 2026-08-19: vllm/vllm-openai:v0.27.1 rejects the DFlash2 draft
@@ -55,7 +61,7 @@ start() {
     "$IMG" \
     /models \
     --served-model-name local \
-    --api-key rjman \
+    "${API_ARGS[@]}" \
     --max-model-len 160000 \
     --gpu-memory-utilization 0.98 \
     --kv-cache-dtype fp8_e4m3 \
@@ -68,7 +74,7 @@ start() {
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
     --speculative-config "$SPEC_CONFIG"
-  echo "started: $NAME (port $PORT, api-key: rjman, restart=always, spec=$SPEC_METHOD)"
+  echo "started: $NAME (port $PORT, auth=$([ -n "$API_KEY" ] && echo on || echo off), restart=always, spec=$SPEC_METHOD)"
   echo "log:   bash $0 logs"
   echo "stop:  bash $0 stop"
   _profiles_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
