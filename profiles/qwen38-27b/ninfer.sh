@@ -8,7 +8,7 @@ _sdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$_sdir/../../.env" ]; then set -a; . "$_sdir/../../.env"; set +a; fi
 
 CONTAINER=ninfer-qwen38-27b
-IMAGE=ninfer:latest
+IMAGE="${IMAGE:-ninfer:latest}"
 MODEL_DIR=$HOME/models/ninfer/Qwen3.8-27B-nvfp4-NInfer
 MODEL_FILE=/models/qwen3_8_27b_nvfp4.ninfer
 PORT=8020
@@ -44,9 +44,14 @@ HOST_STATE_SLOTS="${HOST_STATE_SLOTS:-8}"       # host checkpoint slots (engine 
 #   vision on  + fp8     pool 229376  ->  MAX_CONTEXT=188224  (82%)
 #   vision on  + nvfp4   pool 410944  ->  MAX_CONTEXT=262144  (64%)
 #   vision off + fp8     pool 257920  ->  MAX_CONTEXT=251392  (97%)
-#   vision off + nvfp4   pool 462144  ->  MAX_CONTEXT=400000  (87%)
+#   vision off + nvfp4   pool 462144  ->  MAX_CONTEXT=262144  (57%, ceiling-bound)
 # Pool tokens scale exactly with the KV byte width, so a new dtype's pool is
 # predictable to <0.01% -- but measure it before adding a row here anyway.
+# 262144 is a hard ceiling regardless of pool size: qwen3_6_27b's kNativeContext
+# (src/targets/qwen3_6_27b/impl/config.h) caps --max-context, and exceeding it
+# fails startup with "max_context exceeds the variant native context capacity".
+# The nvfp4 pools are larger than that ceiling, so their spare capacity goes to
+# keeping other sessions' KV resident rather than to a longer single request.
 # Vision on additionally caps images/video at 32768 merged tokens; turning it
 # off buys ~12% more pool (available-after-weights 10.82 -> 11.10 GiB), not the
 # whole media reservation. All pairs keep MTP3 speculative decoding.
@@ -55,7 +60,7 @@ case "$VISION:$KV_DTYPE" in
   1:fp8)   VISION_FLAG=(--vision); MAX_CONTEXT=188224 ;;
   1:nvfp4) VISION_FLAG=(--vision); MAX_CONTEXT=262144 ;;
   0:fp8)   VISION_FLAG=();         MAX_CONTEXT=251392 ;;
-  0:nvfp4) VISION_FLAG=();         MAX_CONTEXT=400000 ;;
+  0:nvfp4) VISION_FLAG=();         MAX_CONTEXT=262144 ;;
   *) echo "no measured KV pool for VISION=$VISION KV_DTYPE=$KV_DTYPE;" \
           "read kv_capacity_tokens from a trial start and add a row" >&2; exit 1 ;;
 esac

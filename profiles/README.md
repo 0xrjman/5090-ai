@@ -233,16 +233,32 @@ bucket above.
 at 4 (concurrency saturated) and `waiting` at 2, but `materializing` stayed at
 **0** — no session was ever evicted and pulled back.
 
-That is the concrete payoff of sizing for capacity. Under `fp8` the same working
-set overflows the 229376-token pool, so the eviction/materialization path runs
-constantly, and that path is where the engine has been seen to wedge: a
-`std::logic_error` ("materialization source has no resident state") out of
-`prepare_materialization` trips `fail_all`, after which **every** request is
-rejected with 503 `service_unavailable` — permanently, with no self-heal. Watch
-for that failure mode, because nothing external notices it: the process stays
-alive, the port keeps listening, `docker ps` reports the container `Up`, and
-`--restart unless-stopped` never fires. `/v1/models` also keeps returning 200,
-since it never reaches the engine; only a real generation request detects it.
+That is the concrete payoff of sizing for capacity.
+
+### The materialization wedge (fixed 2026-09-02)
+
+A `std::logic_error` ("materialization source has no resident state") out of
+`prepare_materialization` trips `fail_all`, after which `worker_loop` returns and
+**every** request is rejected with 503 `service_unavailable` — permanently. It hit
+7 times in 27 minutes of live agent traffic before it was fixed.
+
+**It was not capacity pressure.** An earlier draft of this section blamed the
+`fp8` eviction path; per-instance JSONL disproved that. Four of the five wedged
+server instances had `checkpoints_dropped = 0` and `private_owners_evicted = 0`,
+`host_kv_bytes` peaked at **0** across every instance, and two failures happened
+with `running = 0`. Instrumenting the throw site showed the source's rewrite
+checkpoint resident on device and merely *shared* (`refs 2 / owned 1`):
+`resident_resources()` counts only states exclusive to the sequence, so the guard
+read a shared-but-present StateImage as absent. The local build now guards the
+handle `selected_state()` actually returns. See `~/ninfer-repro/` for the
+reproducer and the upstream Issue draft.
+
+**Nothing external notices this class of failure**, so it is worth knowing even
+after the fix: the process stays alive, the port keeps listening, `docker ps`
+reports the container `Up`, and `--restart unless-stopped` never fires.
+`/v1/models` also keeps returning 200, since it never reaches the engine; only a
+real generation request detects it. `profiles/watchdog/engine-autostart.sh` probes
+with a real generation request every minute and restarts after two strikes.
 
 ### Measurement caveat
 
