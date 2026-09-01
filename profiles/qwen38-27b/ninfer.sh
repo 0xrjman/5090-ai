@@ -29,7 +29,14 @@ MODEL_ID=local
 KV_DTYPE="${KV_DTYPE:-nvfp4}"
 HOST_KV_MIB="${HOST_KV_MIB:-24576}"   # pinned-CPU KV arena for long-conv spill; 24 GiB holds ~500K tokens of fp8 KV, ~900K of nvfp4
 DEVICE_STATE_SLOTS="${DEVICE_STATE_SLOTS:-4}"   # device checkpoint slots (pinned; engine default is +C)
-HOST_STATE_SLOTS="${HOST_STATE_SLOTS:-8}"       # host checkpoint slots (engine default)
+# A checkpoint needs BOTH a StateImage replica and its KV coverage to stay valid
+# (architecture doc 4.4), so state slots -- not host KV bytes -- are what bounds
+# how many sessions stay resident. With 8 host slots against ~14 live sessions a
+# 158K-token conversation was evicted and paid a 74 s cold prefill while the 24
+# GiB host KV arena sat at 10%. Each host slot pins ~147 MiB.
+HOST_STATE_SLOTS="${HOST_STATE_SLOTS:-32}"
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-8}"                 # engine hard limit is 8
+MAX_PRIVATE_CONTINUATIONS="${MAX_PRIVATE_CONTINUATIONS:-32}"
 # Shared-prefix publication is the second checkpoint reference on a continuation's
 # StateImage, which makes state_exclusive_to_sequence false and trips the wedge
 # ("materialization source has no resident state", program_impl.h:4772). 0 keeps
@@ -103,7 +110,8 @@ start() {
     --request-log-jsonl /reqlog/requests.jsonl \
     "${API_ARGS[@]}" --model-id ${MODEL_ID} \
     --max-context ${MAX_CONTEXT} --kv-capacity auto --kv-dtype ${KV_DTYPE} \
-    --max-concurrency 4 --pending-timeout-ms 90000 --host-kv-mib ${HOST_KV_MIB} \
+    --max-concurrency ${MAX_CONCURRENCY} --pending-timeout-ms 90000 --host-kv-mib ${HOST_KV_MIB} \
+    --max-private-continuations ${MAX_PRIVATE_CONTINUATIONS} \
     --device-state-slots ${DEVICE_STATE_SLOTS} --host-state-slots ${HOST_STATE_SLOTS} \
     --max-shared-prefixes ${MAX_SHARED_PREFIXES} \
     "${VISION_FLAG[@]}" \
