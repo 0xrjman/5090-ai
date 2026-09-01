@@ -45,6 +45,23 @@ profiles/dashboard/dashboard.sh [start|stop|status|logs]
    ```
 4. Add the row/column to the matrix in the root `README.md`.
 
+## Using Claude Code
+
+When driving this repo through Claude Code against the local serving
+endpoint (non-first-party `ANTHROPIC_BASE_URL`), add to `~/.claude/settings.json`:
+
+    {
+      "env": {
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+        "ENABLE_TOOL_SEARCH": "false"
+      }
+    }
+
+`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` strips `anthropic-beta` headers the
+proxy rejects (hard 400s otherwise) and also forces tool search off.
+If the endpoint 400s on `thinking: adaptive`, add
+`"CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING": "1"`.
+
 ## Notes (measured)
 
 - SGLang + DSpark speculative decoding on this 5090 deployment gave **no** decode
