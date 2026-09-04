@@ -16,3 +16,9 @@ __pycache__/
 csv
 
 # weights and JIT caches live under _archive/ and are ignored by _archive/.gitignore
+
+# local claude session config / runtime state (any level)
+.claude/
+
+# macOS
+.DS_Store
