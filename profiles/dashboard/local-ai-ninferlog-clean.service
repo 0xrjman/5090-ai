@@ -1,0 +1,10 @@
+[Unit]
+Description=Rollover the ninfer request log if it exceeds 1 GiB
+ConditionPathExists=/home/rjman/ninfer-logs/requests.jsonl
+
+[Service]
+Type=oneshot
+User=root
+# Invoke via the system bash (bin_t) so SELinux does not deny initrc_t the
+# execve of a script living in a user home directory.
+ExecStart=/usr/bin/bash /home/rjman/Servers/local-ai/profiles/dashboard/rotate-ninfer-log.sh

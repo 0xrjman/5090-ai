@@ -44,21 +44,25 @@ MAX_REQ = 2000
 MAX_ERR = 500
 MAX_RAW = 400           # recent raw lines kept for the live-log panel
 MAX_SEEN = 1600         # LRU bound for log-line dedupe
+WORKLOAD_MAX = 120      # recent ninfer throughput windows kept for the Workload panel
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "metrics.db")
+# Structured per-request/throughput log the engine writes (root-owned, world-readable).
+# Read-only source for the Workload panel; the docker-logs stdout tail stays as-is.
+NINFER_JSONL = os.path.expanduser(os.path.join("~", "ninfer-logs", "requests.jsonl"))
 
-TS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)\]")
+TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)")
 VLLM_TS_RE = re.compile(r"\b(\d{2})-(\d{2}) (\d{2}:\d{2}:\d{2})\b")
-KV_RE = re.compile(r"([a-zA-Z_]+)=([^\s]+)")
-REQ_RE = re.compile(r"request id=(\d+)")
-MTP_RE = re.compile(r"(\d+(?:\.\d+)?)tok/round \((\d+(?:\.\d+)?)%\)")
+REQ_RE = re.compile(r"^req#(\d+)\s+(.*)$")
 KV_CAP_RE = re.compile(r"kv_capacity_tokens=(\d+)")
 
 
 def _num(s):
     if s is None:
         return None
-    m = re.match(r"[-+]?\d+(?:\.\d+)?", str(s).strip())
-    return float(m.group(0)) if m else None
+    m = re.match(r"([-+]?\d+(?:\.\d+)?)([kM]?)", str(s).strip().replace(",", ""))
+    if not m:
+        return None
+    return float(m.group(1)) * {"k": 1e3, "M": 1e6}.get(m.group(2), 1.0)
 
 
 def _f(s):
@@ -70,8 +74,12 @@ def _i(s):
     return int(v) if v is not None else None
 
 
-def _kv(line):
-    return {k: v for k, v in KV_RE.findall(line)}
+def _dur(s):
+    """'405 ms' / '11.3s' / '1m 10.4s' -> seconds (NInfer's human-readable durations)."""
+    m = re.match(r"(?:(\d+(?:\.\d+)?)m\s+)?(\d+(?:\.\d+)?)\s*(ms|s)", (s or "").strip())
+    if not m:
+        return None
+    return (float(m.group(1)) * 60.0 if m.group(1) else 0.0) + float(m.group(2)) / (1000.0 if m.group(3) == "ms" else 1.0)
 
 
 def _after(line, label):
@@ -82,15 +90,19 @@ def _after(line, label):
     return line[i + len(label):].split(",")[0].split()[0] if line[i + len(label):].split(",")[0].split() else None
 
 
+def _ts_epoch(s):
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(s, fmt).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
 def _line_ts(line):
     m = TS_RE.match(line)
     if m:
-        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
-            try:
-                return datetime.datetime.strptime(m.group(1), fmt).timestamp()
-            except ValueError:
-                continue
-        return None
+        return _ts_epoch(m.group(1))
     # vLLM: "09-01 07:49:13" (no year, container TZ may differ from host). Only
     # relative deltas are reliable; restamp() anchors the newest line to wall
     # clock so the year/TZ guess cancels out in the back-fill.
@@ -106,52 +118,138 @@ def _line_ts(line):
 
 
 def parse_ninfer(line):
-    """Return an event dict for a metric-bearing NInfer line, else None."""
-    t = _line_ts(line)
-    if "[ninfer-serve] throughput" in line and "interval_ms=" in line:
-        kv = _kv(line)
-        return {"kind": "tp", "t": t,
-                "prefill": _f(kv.get("prefill_tokens_per_second")),
-                "decode": _f(kv.get("decode_tokens_per_second")),
-                "running": _i(kv.get("running")), "prefilling": _i(kv.get("prefilling")),
-                "decode_ready": _i(kv.get("decode_ready")), "waiting": _i(kv.get("waiting")),
-                "avg_decode_batch": _f(kv.get("average_decode_batch"))}
-    req = REQ_RE.search(line)
-    if req:
-        rid = req.group(1)
-        if "status=done" in line:
-            kv = _kv(line)
-            m = MTP_RE.search(line)
-            _dur = _f(kv.get("duration_ms"))
-            return {"kind": "done", "t": t, "req": rid,
-                    "finish": kv.get("finish_reason"), "tool_calls": _i(kv.get("tool_calls")),
-                    "prompt": _i(kv.get("prompt_tokens")), "gen": _i(kv.get("completion_tokens")),
-                    "cache": _i(kv.get("prefix_cache_hit_tokens")),
-                    "reuse": kv.get("prefix_reuse_path"),
-                    "ttft_ms": _f(kv.get("ttft_ms")),
-                    "prefill": _f(kv.get("prefill_tokens_per_second")),
-                    "decode": _f(kv.get("decode_tokens_per_second")),
-                    "wall": (_dur / 1000.0) if _dur is not None else None,
-                    "mtp_round": float(m.group(1)) if m else None,
-                    "mtp_pct": float(m.group(2)) if m else None}
-        if "status=error" in line:
-            msg = line.split("message=", 1)[1].strip() if "message=" in line else ""
-            return {"kind": "err", "t": t, "req": rid, "msg": msg}
-        if "status=rejected" in line:
-            kv = _kv(line)
-            msg = line.split("message=", 1)[1].strip() if "message=" in line else ""
-            return {"kind": "rej", "t": t, "req": rid, "status": _i(kv.get("status")),
-                    "code": kv.get("code"), "msg": msg}
-        if "status=submitted" in line:
-            kv = _kv(line)
-            proto = ("anthropic" if "anthropic_messages" in line
-                     else "openai" if "openai_chat_completions" in line else "?")
-            return {"kind": "sub", "t": t, "req": rid, "proto": proto,
-                    "stream": kv.get("stream") == "true",
-                    "msgs": _i(kv.get("messages")), "max_tokens": _i(kv.get("requested_output_tokens"))}
-        if "status=cancelled" in line:
+    """Return an event dict for a metric-bearing NInfer line, else None.
+
+    Log format: `YYYY-MM-DD HH:MM:SS.mmm LEVEL label value | label value | ...`
+    (pipe-separated, human-readable). Kinds: the 5s `throughput` heartbeat,
+    `req#N started|done`, and the terminal `req#N cancelled|response failed`.
+    """
+    m = TS_RE.match(line)
+    if not m:
+        return None
+    t = _ts_epoch(m.group(1))
+    head, sep, rest = line[m.end():].strip().partition(" | ")
+    # head = "LEVEL <first field>" (the level sits between timestamp and message);
+    # rest = the remaining pipe-separated fields.
+    lead = head.split(None, 1)
+    if len(lead) < 2:
+        return None
+    first = lead[1]
+    fields = rest.split(" | ") if sep else []
+    if first == "throughput":
+        return _ninfer_tp(t, fields)
+    m = REQ_RE.match(first)
+    if not m:
+        return None
+    rid, phrase = m.group(1), m.group(2).strip()
+    if phrase == "done":
+        return _ninfer_done(t, rid, fields)
+    if phrase == "started":
+        return _ninfer_sub(t, rid, fields)
+    if phrase.startswith("cancelled") or phrase.startswith("response failed") \
+            or phrase.startswith("failed"):
+        # the engine logs client disconnects (its own 499s) at INFO; treat those
+        # as cancels so only server-side failures count as errors. `failed during
+        # generation` (504 queue timeout) is the sole terminal for the request, so
+        # leaving it unparsed would leak it into inflight as a ghost stream.
+        if phrase.startswith("cancelled") or "client disconnected" in rest:
             return {"kind": "cancel", "t": t, "req": rid}
+        return {"kind": "err", "t": t, "req": rid,
+                "msg": phrase + ((" | " + rest) if rest else "")}
     return None
+
+
+def _ninfer_tp(t, fields):
+    """`throughput | 5.0s | prefill X tok/s (N tok) | decode Y tok/s (N tok) |
+    running R (prefill P, decode-ready D) | [waiting W |] batch B | host ...` --
+    prefill/decode sections and waiting appear only when non-zero; a missing
+    section means 0.0 tok/s that window, so the tp samples never carry None."""
+    ev = {"kind": "tp", "t": t, "prefill": 0.0, "decode": 0.0, "running": None,
+          "prefilling": 0, "decode_ready": 0, "waiting": None, "avg_decode_batch": None}
+    for f in fields:
+        p = f.split(None, 1)
+        if not p:
+            continue
+        label = p[0]
+        val = p[1] if len(p) > 1 else ""
+        if label == "prefill":
+            ev["prefill"] = _f(val)
+        elif label == "decode":
+            ev["decode"] = _f(val)
+        elif label == "running":
+            ev["running"] = _i(val)
+            m = re.search(r"\(([^)]*)\)", val)
+            if m:
+                for piece in m.group(1).split(","):
+                    pm = re.match(r"(prefill|decode-ready)\s+(\d+)", piece.strip())
+                    if not pm:
+                        continue
+                    if pm.group(1) == "prefill":
+                        ev["prefilling"] = int(pm.group(2))
+                    else:
+                        ev["decode_ready"] = int(pm.group(2))
+        elif label == "waiting":
+            ev["waiting"] = _i(val)
+        elif label == "batch":
+            ev["avg_decode_batch"] = _f(val)
+    return ev
+
+
+def _ninfer_done(t, rid, fields):
+    """`<proto> | <finish> | prompt N | output N | cache N (X%[, path]) | TTFT d |
+    total d | [queue d |] prefill X tok/s | decode Y tok/s | mtp ...` -- the
+    prefill/decode/mtp sections are absent on cancelled requests."""
+    ev = {"kind": "done", "t": t, "req": rid,
+          "finish": fields[1] if len(fields) > 1 else None,
+          "prompt": None, "gen": None, "cache": None, "reuse": None,
+          "ttft_ms": None, "prefill": None, "decode": None, "wall": None,
+          "mtp_round": None, "mtp_pct": None}
+    for f in fields[2:]:
+        p = f.split(None, 1)
+        if len(p) < 2:
+            continue
+        label, val = p
+        if label == "prompt":
+            ev["prompt"] = _i(val)
+        elif label == "output":
+            ev["gen"] = _i(val)
+        elif label == "cache":
+            ev["cache"] = _i(val)
+            m = re.search(r"\([^)]*,\s*([^,()]+)\)", val)
+            if m:
+                ev["reuse"] = m.group(1).strip()
+        elif label == "TTFT":
+            d = _dur(val)
+            ev["ttft_ms"] = round(d * 1000.0, 1) if d is not None else None
+        elif label == "total":
+            ev["wall"] = _dur(val)
+        elif label in ("prefill", "decode"):
+            ev[label] = _f(val)
+        elif label == "mtp":
+            m = re.match(r"accepted\s+([\d,]+)/([\d,]+)\s*\(([\d.]+)%\)", val)
+            if m:
+                ev["mtp_pct"] = _f(m.group(3))
+    return ev
+
+
+def _ninfer_sub(t, rid, fields):
+    """`<proto> stream|non-stream | N messages | max output N | thinking ...`."""
+    ev = {"kind": "sub", "t": t, "req": rid, "proto": None, "stream": None,
+          "msgs": None, "max_tokens": None}
+    if fields:
+        p0 = fields[0].split()
+        if p0:
+            ev["proto"] = p0[0]
+            ev["stream"] = p0[1] == "stream" if len(p0) > 1 else None
+    for f in fields[1:]:
+        m = re.match(r"([\d,]+)\s+messages\b", f)
+        if m:
+            ev["msgs"] = _i(m.group(1))
+            continue
+        m = re.match(r"max output\s+([\d,]+)", f)
+        if m:
+            ev["max_tokens"] = _i(m.group(1))
+    return ev
 
 
 def parse_vllm(line):
@@ -241,6 +339,71 @@ def pull_lines(st, name, tail):
     return fresh
 
 
+def _workload(rec):
+    """Distill one ninfer `throughput` JSONL event into the Workload-panel metrics.
+    headline = decode's share of GPU (device) time; low = prefill is starving decode."""
+    wcs = ((rec.get("host_work") or {}).get("work_class_seconds") or {})
+    pdw = wcs.get("prefill_device_wait") or 0
+    ddw = wcs.get("decode_device_wait") or 0
+    tot = pdw + ddw
+    dshare = (ddw / tot) if tot > 0 else None
+    pressure = ((rec.get("context_cache") or {}).get("pressure") or {})
+    parts = {k: pressure.get(k, 0) for k in (
+        "checkpoints_dropped", "private_owners_evicted", "shared_owners_degraded",
+        "spill_pages", "search_budget_exhaustions")}
+    sched = rec.get("scheduler") or {}
+    tps = rec.get("throughput_tokens_per_second") or {}
+    return {
+        "ts": rec.get("timestamp_unix_ms"),
+        "decode_share": round(dshare, 4) if dshare is not None else None,
+        "prefill_share": round(1 - dshare, 4) if dshare is not None else None,
+        "thrash": sum(v for v in parts.values() if isinstance(v, (int, float))),
+        "thrash_parts": parts,
+        "running": sched.get("running"),
+        "waiting": sched.get("waiting"),
+        "decode_tps": round(tps.get("decode") or 0, 1),
+        "prefill_tps": round(tps.get("prefill") or 0, 1),
+    }
+
+
+def pull_jsonl(st, path):
+    """Ingest new ninfer `throughput` events from the JSONL (offset-based). A line still
+    being written is held back until its newline arrives; a shrink (rollover) resets."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    off = st.jsonl_off
+    if off is None:
+        st.jsonl_off = size   # first contact: read only new events from the tail
+        return
+    if off > size:
+        off = 0               # file was truncated/rotated: restart from the top
+    if off >= size:
+        return
+    try:
+        with open(path, "rb") as f:
+            f.seek(off)
+            buf = f.read()
+    except OSError:
+        return
+    last_nl = buf.rfind(b"\n")
+    if last_nl < 0:
+        return               # no complete line yet; re-read next poll
+    for ln in buf[:last_nl + 1].split(b"\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rec = json.loads(ln)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if rec.get("event") != "throughput":
+            continue
+        st.workload.append(_workload(rec))
+    st.jsonl_off = off + last_nl + 1
+
+
 def kv_capacity_tokens(name):
     m = KV_CAP_RE.findall(docker("logs", name))
     return int(m[-1]) if m else None
@@ -307,6 +470,8 @@ class Store:
         self.kv_started = None    # container StartedAt that kv_total was captured for
         self.boot = time.time()
         self.lock = threading.Lock()
+        self.jsonl_off = None      # byte offset into NINFER_JSONL (None = not started yet)
+        self.workload = deque(maxlen=WORKLOAD_MAX)   # recent ninfer throughput windows
 
     def reset_target(self, name):
         self.tp.clear()
@@ -321,6 +486,8 @@ class Store:
         self.last_line_ts = 0
         self.kv_total = None
         self.kv_started = None
+        self.jsonl_off = None
+        self.workload.clear()
         self.target = name
         self.framework = SERVED_FW.get(name, name)
 
@@ -462,6 +629,7 @@ def poll_loop(st, tail, conn):
                     if started and started != st.kv_started:
                         st.kv_total = kv_capacity_tokens(name)
                         st.kv_started = started
+                        st.inflight.clear()  # ghosts from the previous engine lifetime
                     fresh = pull_lines(st, name, tail)
                     parser = PARSERS.get(st.framework)
                     if parser is not None and fresh:
@@ -471,6 +639,8 @@ def poll_loop(st, tail, conn):
                             for _, ev in evs:
                                 st.ingest(ev, now)
                             record(conn, name, st.framework, evs)
+                    if st.framework == "ninfer":
+                        pull_jsonl(st, NINFER_JSONL)
         g = gpu_stat()
         ct = cpu_temp()
         therm = None
@@ -506,6 +676,7 @@ def poll_loop(st, tail, conn):
 
 
 def _pct(vals, p):
+    vals = [v for v in vals if v is not None]
     if not vals:
         return None
     s = sorted(vals)
@@ -621,7 +792,8 @@ def build_state(st, window):
                 "p95_ttft_ms": _pct([r["ttft_ms"] for r in done], 95),
                 "avg_wall_s": round(sum(w for w in wall if w is not None)
                                     / max(1, len([w for w in wall if w is not None])), 2),
-                "max_wall_s": round(max(w for w in wall if w is not None), 2),
+                "max_wall_s": (round(max(w for w in wall if w is not None), 2)
+                               if any(w is not None for w in wall) else None),
                 "avg_decode_tps": _mean([r["decode"] for r in done]),
                 "avg_mtp_pct": _mean([r["mtp_pct"] for r in done]),
                 "avg_mtp_round": _mean([r["mtp_round"] for r in done]),
@@ -669,9 +841,11 @@ def build_state(st, window):
         for _lo, _hi, _lab in _buckets:
             _b = [r for r in done if r["prompt"] is not None and _lo <= r["prompt"] < _hi]
             if _b or done:
+                _ttft = _mean([r["ttft_ms"] for r in _b])
+                _wall = _mean([r["wall"] for r in _b])
                 ctx_hist.append({"label": _lab, "n": len(_b),
-                                 "avg_ttft_ms": round(_mean([r["ttft_ms"] for r in _b]), 0) if _b else None,
-                                 "avg_wall_s": round(_mean([r["wall"] for r in _b]), 1) if _b else None,
+                                 "avg_ttft_ms": round(_ttft) if _ttft is not None else None,
+                                 "avg_wall_s": _wall,
                                  "avg_decode": _mean([r["decode"] for r in _b]) if _b else None})
         scatter = [{"x": r["prompt"], "y": r["decode"], "ttft": r["ttft_ms"]}
                    for r in done if r["prompt"] is not None and r["decode"] is not None][-80:]
@@ -711,18 +885,31 @@ def build_state(st, window):
         gpu_now = st.gpu_now
         gpu_series = [[round(t, 3), u] for t, u in st.gpu][-160:]
 
+        wl_latest = st.workload[-1] if st.workload else None
+        wl_stale = None
+        if wl_latest and wl_latest.get("ts"):
+            wl_stale = now - wl_latest["ts"] / 1000.0
+        workload = {
+            "has": bool(st.workload),
+            "latest": wl_latest,
+            "stale_s": round(wl_stale, 1) if wl_stale is not None else None,
+            "series": [[w.get("decode_share"), w.get("thrash")] for w in st.workload][-120:],
+        }
+
     dec_vals = [p[1] for p in series]
     pre_vals = [p[2] for p in series]
     peak = max([max(dec_vals) if dec_vals else 0, max(pre_vals) if pre_vals else 0], default=0)
 
     therm_win = [p for p in st.therm if p[0] >= now - window]
     t_now = st.therm[-1] if st.therm else None
+    g_max = [p[1] for p in therm_win if p[1] is not None]
+    c_max = [p[2] for p in therm_win if p[2] is not None]
     thermal = {
         "now": ({"gpu_c": t_now[1], "cpu_c": t_now[2], "gpu_w": t_now[3],
                  "fan_pct": t_now[4]} if t_now else {}),
         "series": _downsample(therm_win),
-        "max_gpu": round(max((p[1] for p in therm_win if p[1] is not None), default=0) or None, 1),
-        "max_cpu": round(max((p[2] for p in therm_win if p[2] is not None), default=0) or None, 1),
+        "max_gpu": round(max(g_max), 1) if g_max else None,
+        "max_cpu": round(max(c_max), 1) if c_max else None,
     }
 
     return {
@@ -750,6 +937,7 @@ def build_state(st, window):
         "recent_requests": recent_req,
         "recent_errors": recent_err,
         "log": raw,
+        "workload": workload,
     }
 
 
@@ -1167,6 +1355,27 @@ canvas.hist,canvas.scatter{height:auto;min-height:170px;flex:1}
   <div class="panel tabpane" id="tp-log" data-tab="log">
     <div class="ph"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg></span><h2>Raw log</h2><span class="note">newest first · live tail</span></div>
     <div class="log" id="log"></div>
+  </div>
+
+  <div class="panel tabpane" id="tp-workload" data-tab="workload">
+    <div class="ph"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9z"/></svg></span><h2>Workload · efficiency</h2><span class="note" id="wl_note"></span></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+      <div class="kvbox">
+        <div class="kvl"><span>Decode 产出占比</span><span class="kvtag">decode share of GPU time</span></div>
+        <div class="kvbig"><b id="wl_decode_share">-</b><span>% of device time</span></div>
+        <div class="kvbar"><i id="wl_fill"></i></div>
+        <div class="kvmeta" id="wl_meta"></div>
+      </div>
+      <div class="kvbox">
+        <div class="kvl"><span>Cache 抖动 / Thrash</span><span class="kvtag">pressure</span></div>
+        <div class="kvbig"><b id="wl_thrash">-</b><span>events</span></div>
+        <div class="kvmeta" id="wl_thrash_meta"></div>
+      </div>
+    </div>
+    <div class="subhead">context · last window</div>
+    <div class="kv" id="wl_ctx"></div>
+    <div class="subhead">decode share of GPU time · recent trend</div>
+    <canvas id="wl_spark" class="spark"></canvas>
   </div>
     </div>
   </div>
@@ -1592,6 +1801,42 @@ function render(s){
       return `<span class="${cls}">${esc(ln)}</span>`;
     }).join("\n")
     :'<span class="muted">no lines yet</span>';
+
+  // Workload panel: headline decode-share gauge + thrash alarm + context + trend.
+  const WL=s.workload||{},WLL=WL.latest;
+  if(WLL){
+    const ds=WLL.decode_share;
+    $("wl_decode_share").textContent=ds==null?"-":(ds*100).toFixed(1);
+    const fill=$("wl_fill");
+    fill.style.width=ds==null?"0%":(ds*100).toFixed(1)+"%";
+    fill.style.background=ds==null?"":(ds>0.6?"var(--grad)":ds>0.35?"var(--pre)":"var(--err)");
+    const thr=WLL.thrash||0;
+    const tEl=$("wl_thrash");
+    tEl.textContent=thr;
+    tEl.style.color=thr>0?"var(--err)":"";
+    const parts=WLL.thrash_parts||{};
+    $("wl_thrash_meta").textContent=thr>0
+      ?("⚠ "+Object.keys(parts).filter(k=>parts[k]>0).map(k=>parts[k]+"× "+k).join(" · "))
+      :"steady · no eviction / spill";
+    $("wl_meta").textContent=WLL.prefill_share!=null?("prefill holds "+(WLL.prefill_share*100).toFixed(1)+"% of device time"):"";
+    $("wl_ctx").innerHTML=kv([
+      ["decode tok/s",WLL.decode_tps==null?"-":fmt(WLL.decode_tps,1)],
+      ["prefill tok/s",WLL.prefill_tps==null?"-":fmt(WLL.prefill_tps,1)],
+      ["running",WLL.running==null?"-":WLL.running],
+      ["waiting",WLL.waiting==null?"-":WLL.waiting],
+    ]);
+  }else{
+    $("wl_decode_share").textContent="-";
+    $("wl_fill").style.width="0%";
+    $("wl_thrash").textContent="-";
+    $("wl_thrash").style.color="";
+    $("wl_thrash_meta").textContent=WL.has?"stale":"waiting for throughput events…";
+    $("wl_meta").textContent="";
+    $("wl_ctx").innerHTML="";
+  }
+  $("wl_note").textContent=WL.stale_s==null?"":("last event "+Math.round(WL.stale_s)+"s ago"+(WL.stale_s>30?" · stale":""));
+  const wser=(WL.series||[]).map(p=>p[0]==null?null:p[0]*100).filter(v=>v!=null);
+  if(wser.length)drawSpark100("wl_spark",wser.slice(-120),C.dec);
 }
 function esc(s){return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
 
@@ -1605,7 +1850,7 @@ async function fetch_(){
     $("meta").textContent="unreachable: "+e;
   }
 }
-const TABS=[["throughput","&#128200;","Throughput"],["therm","&#127777;","Thermal"],["streams","&#128256;","Streams"],["load","&#128202;","Load · KV · Ctx"],["req","&#128230;","Req · Queue"],["recent","&#128344;","Recent"],["log","&#128220;","Log"]];
+const TABS=[["throughput","&#128200;","Throughput"],["workload","&#9889;","Workload"],["therm","&#127777;","Thermal"],["streams","&#128256;","Streams"],["load","&#128202;","Load · KV · Ctx"],["req","&#128230;","Req · Queue"],["recent","&#128344;","Recent"],["log","&#128220;","Log"]];
 let activeTab=(()=>{const t=new URLSearchParams(location.search).get("tab");return TABS.some(x=>x[0]===t)?t:"throughput";})();
 function buildSidebar(){
   const nav=$("sb_nav");nav.innerHTML="";
@@ -1633,6 +1878,10 @@ function drawTab(key){
     const A=s.analysis||{};drawHistogram(A.ctx_hist||[]);drawScatter(A.scatter||[]);
     const gser=((s.gpu||{}).series||[]).map(p=>p[1]).filter(v=>v!=null);
     if(gser.length)drawSpark100("gpu_spark",gser.slice(-120),C.dec);
+  }
+  else if(key==="workload"){
+    const wser=((s.workload||{}).series||[]).map(p=>p[0]==null?null:p[0]*100).filter(v=>v!=null);
+    if(wser.length)drawSpark100("wl_spark",wser.slice(-120),C.dec);
   }
 }
 function initSidebar(){

@@ -27,22 +27,55 @@ MODEL_ID=local
 # working set resident, and an evicted session costs a full re-prefill (~45 s at
 # 150K) against ~1.5 s on a prefix-cache hit. See profiles/README.md for the A/B.
 KV_DTYPE="${KV_DTYPE:-nvfp4}"
-HOST_KV_MIB="${HOST_KV_MIB:-24576}"   # pinned-CPU KV arena for long-conv spill; 24 GiB holds ~500K tokens of fp8 KV, ~900K of nvfp4
-DEVICE_STATE_SLOTS="${DEVICE_STATE_SLOTS:-4}"   # device checkpoint slots (pinned; engine default is +C)
-# A checkpoint needs BOTH a StateImage replica and its KV coverage to stay valid
-# (architecture doc 4.4), so state slots -- not host KV bytes -- are what bounds
-# how many sessions stay resident. With 8 host slots against ~14 live sessions a
-# 158K-token conversation was evicted and paid a 74 s cold prefill while the 24
-# GiB host KV arena sat at 10%. Each host slot pins ~147 MiB.
-HOST_STATE_SLOTS="${HOST_STATE_SLOTS:-32}"
-MAX_CONCURRENCY="${MAX_CONCURRENCY:-8}"                 # engine hard limit is 8
-MAX_PRIVATE_CONTINUATIONS="${MAX_PRIVATE_CONTINUATIONS:-32}"
-# Shared-prefix publication is the second checkpoint reference on a continuation's
-# StateImage, which makes state_exclusive_to_sequence false and trips the wedge
-# ("materialization source has no resident state", program_impl.h:4772). 0 keeps
-# private_response_replay (66% of live requests) and gives up shared_stable_prefix
-# (12%). Set back to 4 only with a reproducer run to confirm the wedge is gone.
-MAX_SHARED_PREFIXES="${MAX_SHARED_PREFIXES:-0}"
+HOST_KV_MIB="${HOST_KV_MIB:-16384}"
+# ---- context cache: stay on the engine defaults ----------------------------
+# Every context-cache capacity flag is deliberately NOT passed. The defaults
+# (docs/serving.md:764-769) at MAX_CONCURRENCY=4 are:
+#   device_state_slots            = max_concurrency          -> 4
+#   host_state_slots              = 8   (types.h:26 constant)
+#   max_private_continuations     = 2 * max_concurrency       -> 8
+#   max_shared_prefixes           = max_concurrency           -> 4
+#   max_long_anchors_per_continuation = 2
+# Overriding them made things worse every time it was tried on this box.
+# Measured 2026-09-03, same-elapsed-window A/B at identical traffic, minute 15:
+#   host_state_slots=8   -> root 29%, TTFT p50 1.27 s, 2854 recomputed tokens
+#   host_state_slots=24  -> root 60%, TTFT p50 5.17 s, 17991 recomputed tokens
+# The knee lands exactly when the host slots fill: a larger checkpoint estate
+# makes each candidate assessment more expensive, the planner's search budget
+# saturates, it evaluates FEWER targets, and it falls back to a root reprefill.
+# Upstream issue #144 is the same defect (closed against 138d76ae, but the
+# reporter had already reproduced on 21a0e85f which contains it; we are the
+# third independent reproduction, on 6e2786c5). Do not "fix" it by raising the
+# search budget either: upstream ran the byte-identical 5ms -> 1s patch and it
+# changed no selected path, it only added ~1 s to every restore.
+# max_shared_prefixes was pinned to 0 here for a while to dodge a wedge. That
+# was a misattribution: all 44 "materialization source has no resident state"
+# errors happened in generations already running 0. Back on the default.
+#
+# HOST_KV_MIB is the one deliberate override. Upstream defaults to 8192 and its
+# reference config uses the same, but 8 host slots x a p90 session of 1.52 GiB
+# needs ~12.2 GiB, and measured peak host KV occupancy at 8 slots was 6.5 GiB.
+# 16 GiB covers both with margin. It is a pinned cudaMallocHost arena committed
+# at startup and never returned before process exit; it counts in Shmem, and
+# swap here is zram (compressed in RAM) so Shmem is effectively unreclaimable.
+# Keep total Shmem under ~40 GiB on this 62.5 GiB box: 40 GiB arena + 64 slots
+# once reached 49.2 GiB Shmem / 538 MiB MemFree and the box did not recover
+# until the container was restarted.
+# max_shared_prefixes is back on the engine default (= max_concurrency = 4). It was pinned to 0
+# after a wedge on 2026-09-03: one request died with "materialization source has no resident state"
+# and every later request got 503 until the container was restarted. The underlying planning defect
+# is NOT fixed and is not reproducible under synthetic load, but the blast radius is: a stale
+# materialization plan now aborts that one transaction instead of failing the whole Engine
+# (program_impl.h prepare_materialization returns false, the caller runs abort_transaction).
+# Expect the occasional single-request HTTP 500 rather than a dead process. Watch the JSONL for
+# error.message == "materialization source has no resident state"; set this back to 0 if the rate
+# is material.
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-4}"
+# Keep this at 4. device_state_slots defaults to MAX_CONCURRENCY and total
+# device StateImage slots = MAX_CONCURRENCY + device_state_slots at ~147 MiB
+# each, so raising concurrency costs VRAM twice over and shrinks the device KV
+# pool: measured kv_capacity 410944 tokens at 4 against 359744 at 8. Engine
+# hard limit is [1,8] (engine.cpp:39-40).
 
 # ---- (VISION, KV_DTYPE) -> MAX_CONTEXT -----------------------------------
 # Override per-run without editing. The login shell here is fish, which has no
@@ -111,9 +144,6 @@ start() {
     "${API_ARGS[@]}" --model-id ${MODEL_ID} \
     --max-context ${MAX_CONTEXT} --kv-capacity auto --kv-dtype ${KV_DTYPE} \
     --max-concurrency ${MAX_CONCURRENCY} --pending-timeout-ms 90000 --host-kv-mib ${HOST_KV_MIB} \
-    --max-private-continuations ${MAX_PRIVATE_CONTINUATIONS} \
-    --device-state-slots ${DEVICE_STATE_SLOTS} --host-state-slots ${HOST_STATE_SLOTS} \
-    --max-shared-prefixes ${MAX_SHARED_PREFIXES} \
     "${VISION_FLAG[@]}" \
     "${PRESERVE_FLAG[@]}" \
     --spec mtp --draft-tokens 3 --lm-head-draft
@@ -124,7 +154,9 @@ start() {
   _profiles_dir="$(cd "$(dirname "$_self")/.." && pwd)"
   echo "ninfer" > "$_profiles_dir/watchdog/.last-engine" 2>/dev/null || true
   _dash="$_profiles_dir/dashboard/dashboard.sh"
-  [ -f "$_dash" ] && bash "$_dash" start || true
+  if [ "${NINFER_NO_DASH:-0}" != "1" ]; then
+    [ -f "$_dash" ] && bash "$_dash" start || true
+  fi
 }
 
 stop() {
